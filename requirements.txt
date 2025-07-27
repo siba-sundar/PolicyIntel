@@ -1,0 +1,8 @@
+langchain
+transformers
+torch
+sentence-transformers
+faiss-cpu
+nltk
+python-docx
+PyPDF2
