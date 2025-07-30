@@ -1,8 +1,10 @@
-langchain
-transformers
-torch
-sentence-transformers
+python-dotenv
 faiss-cpu
-nltk
-python-docx
-PyPDF2
+pydantic
+fastapi
+uvicorn
+requests
+httpx
+PyMuPDF
+numpy
+groq
