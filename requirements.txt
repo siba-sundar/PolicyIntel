@@ -1,3 +1,4 @@
+google-genai>=0.5.0
 python-dotenv
 faiss-cpu
 pydantic
@@ -7,4 +8,3 @@ requests
 httpx
 PyMuPDF
 numpy
-groq
