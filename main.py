@@ -148,7 +148,7 @@ You are an expert insurance policy analyst and answering engine. Your primary di
 # ---- LLM Call ----
 def ask_llm(prompt: str) -> str:
     try:
-        # Use the official Gemini 2.5 Flash Lite model
+        # Use the official Gemini 2.5 Flash model for text generation
         client = genai.Client(api_key=GEMINI_API_KEY)
         from google.genai import types
         response = client.models.generate_content(
@@ -186,15 +186,14 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
         faiss_cache[request.documents] = (index, chunk_list)
 
     try:
-        # Batch embed all questions at once
-        question_embeddings = await get_embeddings(request.questions)
         answers = []
-        for question, q_emb in zip(request.questions, question_embeddings):
-            relevant_chunks = await search_faiss(index, q_emb, chunk_list)
+        for question in request.questions:
+            q_emb = await get_embeddings([question])
+            relevant_chunks = await search_faiss(index, q_emb[0], chunk_list)
             prompt = build_prompt(question, relevant_chunks)
             llm_output = ask_llm(prompt)
 
-            # Extract actual value from JSON response
+            # ✅ Extract actual value from JSON response
             try:
                 parsed = json.loads(llm_output)
                 answers.append(parsed.get("answer", llm_output))
