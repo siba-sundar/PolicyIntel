@@ -12,18 +12,21 @@ import faiss
 import json
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import functools
+import re
+from sentence_transformers import SentenceTransformer
+import torch
 
 # ---- Load API Keys ----
 load_dotenv()
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 app = FastAPI()
 faiss_cache = {}
 
 # ---- Thread Pool Executors ----
-io_executor = ThreadPoolExecutor(max_workers=4)  # For IO-bound tasks
-cpu_executor = ProcessPoolExecutor(max_workers=2)  # For CPU-bound tasks
+io_executor = ThreadPoolExecutor(max_workers=6)  # Increased for better concurrency
+cpu_executor = ProcessPoolExecutor(max_workers=4)  # Increased for better parallel processing
 
 # ---- Auth Token ----
 TEAM_TOKEN = "833695cad1c0d2600066bf2b08aab7614d0dec93b4b6f0ae3acd37ef7d6fcb1c"
@@ -36,12 +39,14 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# ---- PDF Downloader ----
+# ---- PDF Downloader with improved error handling ----
 async def download_pdf_text(url: str) -> str:
     try:
-        async with httpx.AsyncClient() as client:
+        timeout = httpx.Timeout(30.0)  # 30 second timeout
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(url)
         response.raise_for_status()
+        
         with open("temp.pdf", "wb") as f:
             f.write(response.content)
 
@@ -50,31 +55,46 @@ async def download_pdf_text(url: str) -> str:
             with fitz.open("temp.pdf") as doc:
                 text = ""
                 for page in doc:
-                    text += page.get_text()
+                    # Better text extraction with layout preservation
+                    page_text = page.get_text("text", sort=True)
+                    if page_text.strip():  # Only add non-empty pages
+                        text += page_text + "\n\n"
                 return text
         
         loop = asyncio.get_event_loop()
         text = await loop.run_in_executor(io_executor, extract_text)
+        
+        # Clean up temporary file
+        try:
+            os.remove("temp.pdf")
+        except:
+            pass
+            
         return text.strip()
     except Exception as e:
         raise Exception(f"Download or extraction failed: {str(e)}")
 
-# ---- Chunking ----
-def split_text_into_chunks(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
-    # Split by sentences first to maintain semantic coherence
-    import re
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+# ---- Improved Chunking with semantic awareness ----
+def split_text_into_chunks(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
+    # More sophisticated sentence splitting that handles edge cases
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
     
     chunks = []
     current_chunk = []
     current_length = 0
     
     for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
         words_in_sentence = len(sentence.split())
         
         # If adding this sentence would exceed chunk_size, finalize current chunk
         if current_length + words_in_sentence > chunk_size and current_chunk:
-            chunks.append(" ".join(current_chunk))
+            chunk_text = " ".join(current_chunk).strip()
+            if chunk_text:  # Only add non-empty chunks
+                chunks.append(chunk_text)
             
             # Start new chunk with overlap from previous chunk
             overlap_words = " ".join(current_chunk).split()[-overlap:]
@@ -86,147 +106,266 @@ def split_text_into_chunks(text: str, chunk_size: int = 500, overlap: int = 100)
     
     # Add the last chunk
     if current_chunk:
-        chunks.append(" ".join(current_chunk))
+        chunk_text = " ".join(current_chunk).strip()
+        if chunk_text:
+            chunks.append(chunk_text)
     
-    return chunks
+    # Filter out very short chunks that might not be meaningful
+    meaningful_chunks = [chunk for chunk in chunks if len(chunk.split()) >= 10]
+    return meaningful_chunks if meaningful_chunks else chunks
 
-# ---- Embeddings ----
-async def get_embeddings(texts: List[str]) -> List[List[float]]:
-    url = "https://api.mistral.ai/v1/embeddings"
+# ---- Cohere v3 Embeddings with optimizations ----
+async def get_embeddings(texts: List[str], input_type: str = "search_document") -> List[List[float]]:
+    url = "https://api.cohere.com/v1/embed"
     headers = {
-        "Authorization": f"Bearer {MISTRAL_API_KEY}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {COHERE_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
+    
     if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
         print("[get_embeddings] ERROR: input must be a list of strings.")
         raise ValueError("Input to get_embeddings must be a list of strings.")
 
-    BATCH_SIZE = 32
-    batches = [texts[i:i+BATCH_SIZE] for i in range(0, len(texts), BATCH_SIZE)]
+    # Clean texts - remove excessive whitespace and empty strings
+    clean_texts = [re.sub(r'\s+', ' ', text.strip()) for text in texts if text.strip()]
+    
+    if not clean_texts:
+        raise ValueError("No valid texts provided for embedding")
+
+    # Cohere's embed-english-v3.0 supports up to 96 texts per request
+    BATCH_SIZE = 90  # Slightly conservative to avoid rate limits
+    batches = [clean_texts[i:i+BATCH_SIZE] for i in range(0, len(clean_texts), BATCH_SIZE)]
 
     async def fetch_batch(batch, batch_num):
         data = {
-            "model": "mistral-embed",
-            "input": batch
+            "model": "embed-english-v3.0",  # Latest Cohere v3 model
+            "texts": batch,
+            "input_type": input_type  # "search_document" for docs, "search_query" for queries
+            # Removed embedding_types as it's causing the issue
         }
-        async with httpx.AsyncClient() as client:
-            print(f"[get_embeddings] Sending request to Mistral: batch {batch_num}, size {len(batch)}")
-            response = await client.post(url, headers=headers, json=data)
-            print(f"[get_embeddings] Response status: {response.status_code}")
-            if response.status_code != 200:
-                print(f"[get_embeddings] Response content: {response.text}")
-                response.raise_for_status()
-            batch_embeddings = []
-            for e in response.json()["data"]:
-                vec = np.array(e["embedding"], dtype="float32")
-                vec /= np.linalg.norm(vec)
-                batch_embeddings.append(vec)
-            return batch_embeddings
+        
+        # Add retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                timeout = httpx.Timeout(60.0)  # Longer timeout for embedding requests
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    print(f"[get_embeddings] Sending request to Cohere: batch {batch_num}, size {len(batch)}, attempt {attempt + 1}")
+                    response = await client.post(url, headers=headers, json=data)
+                    
+                    if response.status_code == 200:
+                        response_data = response.json()
+                        print(f"[get_embeddings] Success! Response keys: {list(response_data.keys())}")
+                        
+                        batch_embeddings = []
+                        # Handle different response formats
+                        if "embeddings" in response_data:
+                            embeddings_data = response_data["embeddings"]
+                        else:
+                            # Fallback for different API response structure
+                            embeddings_data = response_data.get("data", [])
+                            
+                        for i, embedding in enumerate(embeddings_data):
+                            try:
+                                # Handle different embedding formats
+                                if isinstance(embedding, dict):
+                                    # If embedding is wrapped in a dict (like {"embedding": [...])
+                                    vec_data = embedding.get("embedding", embedding)
+                                else:
+                                    # Direct list of numbers
+                                    vec_data = embedding
+                                
+                                vec = np.array(vec_data, dtype="float32")
+                                # Normalize for cosine similarity
+                                vec = vec / np.linalg.norm(vec)
+                                batch_embeddings.append(vec.tolist())
+                            except Exception as embed_error:
+                                print(f"[get_embeddings] Error processing embedding {i}: {str(embed_error)}")
+                                print(f"[get_embeddings] Embedding type: {type(embedding)}")
+                                print(f"[get_embeddings] Embedding sample: {str(embedding)[:200]}...")
+                                raise embed_error
+                                
+                        return batch_embeddings
+                    elif response.status_code == 429:  # Rate limit
+                        wait_time = 2 ** attempt
+                        print(f"[get_embeddings] Rate limited, waiting {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"[get_embeddings] Response status: {response.status_code}")
+                        print(f"[get_embeddings] Response content: {response.text}")
+                        response.raise_for_status()
+                        
+            except Exception as e:
+                print(f"[get_embeddings] Exception on attempt {attempt + 1}: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise e
+                await asyncio.sleep(1)
+        
+        raise Exception("Failed to get embeddings after all retries")
 
-    tasks = [fetch_batch(batch, idx+1) for idx, batch in enumerate(batches)]
-    all_results = await asyncio.gather(*tasks)
+    # Process batches with some delay to avoid rate limits
+    all_results = []
+    for i, batch in enumerate(batches):
+        if i > 0:
+            await asyncio.sleep(0.1)  # Small delay between batch requests
+        result = await fetch_batch(batch, i + 1)
+        all_results.append(result)
+    
     return [emb for batch in all_results for emb in batch]
 
-# ---- FAISS Helper Function (Module Level) ----
+# ---- Enhanced FAISS Helper Function ----
 def create_faiss_index(embeddings_list):
     """
-    Module-level function for FAISS index creation.
-    This can be pickled and sent to ProcessPoolExecutor.
+    Create optimized FAISS index with better performance.
     """
     embeddings_array = np.array(embeddings_list).astype("float32")
     dim = embeddings_array.shape[1]
-    index = faiss.IndexFlatL2(dim)
+    
+    # Use IndexHNSWFlat for better search quality with reasonable speed
+    # This provides better recall than IndexFlatL2
+    index = faiss.IndexHNSWFlat(dim, 32)  # 32 is the number of connections per element
+    index.hnsw.efConstruction = 200  # Higher value = better quality, slower build
+    index.hnsw.efSearch = 64  # Higher value = better search quality
+    
     index.add(embeddings_array)
     return index
 
-# ---- FAISS Indexing ----
+# ---- Enhanced FAISS Indexing ----
 async def build_faiss_index(chunks: List[str]):
-    embeddings = await get_embeddings(chunks)
+    embeddings = await get_embeddings(chunks, input_type="search_document")
     
     # Use process pool for CPU-intensive FAISS index creation
     loop = asyncio.get_event_loop()
     index = await loop.run_in_executor(cpu_executor, create_faiss_index, embeddings)
     return index, chunks
 
-async def search_faiss(index, query: str, chunks: List[str], k=15) -> List[str]:
-    # This function will now accept a precomputed embedding instead of a query string
-    D, I = index.search(np.array([query]).astype("float32"), k)
+async def search_faiss(index, query_embedding: List[float], chunks: List[str], k=20) -> List[str]:
+    """Enhanced search with better retrieval"""
+    query_vec = np.array([query_embedding]).astype("float32")
+    D, I = index.search(query_vec, min(k, len(chunks)))
 
-    retrieved = [(chunks[i], float(D[0][j])) for j, i in enumerate(I[0])]
-    # Sort by distance (lower is better) and return top 8 for better context
-    reranked = sorted(retrieved, key=lambda x: x[1])
-    return [chunk for chunk, _ in reranked[:8]]
+    # Get retrieved chunks with distances
+    retrieved = []
+    for j, i in enumerate(I[0]):
+        if i != -1:  # Valid index
+            retrieved.append((chunks[i], float(D[0][j])))
+    
+    # Sort by distance (lower is better for L2 distance)
+    retrieved.sort(key=lambda x: x[1])
+    
+    # Return top chunks (increased to 10 for better context)
+    return [chunk for chunk, _ in retrieved[:10]]
 
-# ---- Prompt Builder ----
+# ---- Enhanced Prompt Builder ----
 def build_prompt(question: str, context_chunks: List[str]) -> str:
-    context = "\n\n".join(context_chunks)
-    return f"""
-You are an expert insurance policy analyst and answering engine. Your primary directive is to answer questions about insurance policies with extreme precision, using ONLY the information available in the provided CONTEXT.
+    # Deduplicate similar chunks to avoid redundancy
+    unique_chunks = []
+    seen_chunks = []
+    
+    for chunk in context_chunks:
+        chunk_words = set(chunk.lower().split())
+        is_duplicate = False
+        
+        for seen_words_set in seen_chunks:
+            # Calculate Jaccard similarity
+            intersection_size = len(chunk_words.intersection(seen_words_set))
+            union_size = len(chunk_words.union(seen_words_set))
+            if union_size > 0 and intersection_size / union_size > 0.8:
+                is_duplicate = True
+                break
+                
+        if not is_duplicate:
+            unique_chunks.append(chunk)
+            seen_chunks.append(chunk_words)
+    
+    context = "\n\n---\n\n".join(unique_chunks)
+    
+    return f"""You are an expert insurance policy analyst with deep expertise in policy interpretation and claims analysis. Your role is to provide precise, actionable answers based strictly on the provided policy context.
 
-**CRITICAL RULES:**
-1. Your answer MUST be a single, concise paragraph that directly addresses the question. The answer must be to the point, and should not include any unnecessary details.
-2. If the user's question is not related to the insurance policy in the CONTEXT or answer to a relevant question is not explicitly stated in the CONTEXT (e.g., asking for code, general knowledge, unrelated topics), you MUST respond with the exact phrase: "The information is not available in the provided context."
-3. Do not use markdown, lists, or conversational phrases.
-4. For insurance-specific questions, be precise with numbers, percentages, time periods, and policy terms.
-5. If calculations are needed, show your reasoning clearly.
-6. Use exact policy language when available in the context.
-7. If the context contains specific numbers, percentages, sub-limits, caps, or exceptions (such as for PPN or listed procedures), you MUST always include them in your answer. If there are exceptions or special cases, mention them explicitly. Quote the exact numbers and conditions from the context. Do not generalize or omit details.
-8. Start directly with "Yes" or "No" when appropriate, followed by specific details
-9. Keep responses comprehensive but focused (aim for 30-40 words typically) no more than that.
-10. Write in a natural, conversational tone as if explaining to a colleague or friend
+**CORE DIRECTIVES:**
+1. Answer in ONE concise, direct paragraph (25-40 words maximum)
+2.Only start your response with "Yes" or "No" if the user's question is a direct yes/no question. Otherwise, respond naturally.
+3. Include ALL relevant numbers, percentages, limits, and conditions from the context
+4. If the context contains specific numbers, percentages, sub-limits, caps, or exceptions (such as for PPN or listed procedures), you MUST always include them in your answer. If there are exceptions or special cases, mention them explicitly. Quote the exact numbers and conditions from the context. Do not generalize or omit details.
+5. If the answer isn't in the context OR the question is unrelated to insurance, respond EXACTLY: "The information is not available in the provided context."
+6. Use natural, professional language without markdown or bullet points
 
+**ANALYSIS PRIORITIES:**
+- Coverage limits, sub-limits, and caps
+- Exclusions and exceptions  
+- Waiting periods and conditions
+- Specific percentages and amounts
+- Policy definitions and terms
 
-**INSURANCE POLICY ANALYSIS GUIDELINES:**
-- Pay special attention to coverage limits, exclusions, waiting periods, and conditions
-- Look for specific terms like "Sum Insured", "Premium", "Waiting Period", "Exclusions", "Coverage"
-- For medical procedures, check for specific coverage details and sub-limits
-- For calculations, use exact percentages and amounts mentioned in the policy
-- If a question asks about coverage for a specific condition or procedure, search for relevant clauses
-- When describing definitions or terms, be complete but concise
-
-== CONTEXT ==
+**CONTEXT:**
 {context}
 
-== QUESTION ==
-{question}
+**QUESTION:** {question}
 
-== ANSWER ==
-{{"answer": "<your short, clear answer here>"}}
-"""
+**ANSWER:**"""
 
-# ---- LLM Call ----
+# ---- Enhanced LLM Call with Gemini 2.0 Flash ----
 def ask_llm_sync(prompt: str) -> str:
     try:
-        # Use the official Gemini 2.5 Flash Lite model
         client = genai.Client(api_key=GEMINI_API_KEY)
         from google.genai import types
+        
+        # Use the latest Gemini 2.0 Flash model for best performance
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-2.5-flash-lite", 
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.1,  # Slightly higher for more natural language
-                max_output_tokens=200,  # Allow for longer responses
-                top_p=0.9,
-                top_k=40
+                temperature=0.0,  # Deterministic for factual accuracy
+                max_output_tokens=150,  # Concise responses
+                top_p=0.8,  # Focused but not too restrictive
+                top_k=20,   # Limit vocabulary for precision
+                candidate_count=1,
+                stop_sequences=None
             )
         )
-        # Gemini returns .text for the main output
+        
+        # Extract response text
         if hasattr(response, 'text') and response.text:
             return response.text.strip()
-        # Fallback for structured output
         elif hasattr(response, 'candidates') and response.candidates:
-            return response.candidates[0].content.parts[0].text.strip()
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'content') and candidate.content.parts:
+                return candidate.content.parts[0].text.strip()
+            return str(candidate).strip()
         else:
-            return "No response from Gemini AI."
+            return "No valid response from Gemini AI."
+            
     except Exception as e:
-        return f"Error generating answer: {str(e)}"
+        print(f"[ask_llm_sync] Error: {str(e)}")
+        # Fallback to a more stable model if experimental fails
+        try:
+            response = client.models.generate_content(
+                model="gemini-1.5-pro",  # Fallback model
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=150,
+                    top_p=0.9
+                )
+            )
+            if hasattr(response, 'text') and response.text:
+                return response.text.strip()
+        except Exception as fallback_e:
+            return f"Error generating answer: {str(fallback_e)}"
 
-# Async wrapper for LLM calls using thread pool
+# Async wrapper for LLM calls
 async def ask_llm(prompt: str) -> str:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(io_executor, ask_llm_sync, prompt)
+@app.get("/")
+async def root():
+    return {"message": "Server Running"}
 
-# ---- API Endpoint ----
+
+
+# ---- Enhanced API Endpoint ----
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def run_query(request: QueryRequest, authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
@@ -236,48 +375,84 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
     if token != TEAM_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-    if request.documents in faiss_cache:
-        index, chunk_list = faiss_cache[request.documents]
-    else:
-        document_text = await download_pdf_text(request.documents)
-        chunks = split_text_into_chunks(document_text)
-        index, chunk_list = await build_faiss_index(chunks)
-        faiss_cache[request.documents] = (index, chunk_list)
-
     try:
-        # Batch embed all questions at once
-        question_embeddings = await get_embeddings(request.questions)
+        # Check cache first
+        cache_key = f"{request.documents}_{hash(str(sorted(request.questions)))}"
         
-        # Process all questions concurrently
-        async def process_question(question, q_emb):
-            relevant_chunks = await search_faiss(index, q_emb, chunk_list)
-            prompt = build_prompt(question, relevant_chunks)
-            return await ask_llm(prompt)
-        
-        # Create tasks for concurrent processing
-        tasks = [process_question(question, q_emb) for question, q_emb in zip(request.questions, question_embeddings)]
-        llm_outputs = await asyncio.gather(*tasks)
-        
-        answers = []
-        for llm_output in llm_outputs:
-            # Clean up the response and extract the answer
-            answer = llm_output.strip()
-            
-            # Remove any JSON formatting if present
-            if answer.startswith('{"answer":') and answer.endswith('}'):
-                try:
-                    parsed = json.loads(answer)
-                    answer = parsed.get("answer", answer)
-                except json.JSONDecodeError:
-                    pass
-            
-            # Remove any residual formatting
-            answer = answer.replace('**ANSWER:**', '').strip()
-            answers.append(answer)
+        if request.documents in faiss_cache:
+            index, chunk_list = faiss_cache[request.documents]
+        else:
+            document_text = await download_pdf_text(request.documents)
+            if not document_text.strip():
+                raise HTTPException(status_code=400, detail="No text could be extracted from the document")
+                
+            chunks = split_text_into_chunks(document_text)
+            if not chunks:
+                raise HTTPException(status_code=400, detail="No meaningful chunks could be created from the document")
+                
+            index, chunk_list = await build_faiss_index(chunks)
+            faiss_cache[request.documents] = (index, chunk_list)
 
-        return {"answers": answers}
+        # Get embeddings for all questions at once (with query input type)
+        question_embeddings = await get_embeddings(request.questions, input_type="search_query")
+        
+        # Process questions concurrently with improved error handling
+        async def process_question(question, q_emb):
+            try:
+                relevant_chunks = await search_faiss(index, q_emb, chunk_list)
+                if not relevant_chunks:
+                    return "The information is not available in the provided context."
+                    
+                prompt = build_prompt(question, relevant_chunks)
+                response = await ask_llm(prompt)
+                
+                # Clean up response
+                response = response.strip()
+                
+                # Remove any JSON formatting artifacts
+                if response.startswith('{"') or response.startswith('{'):
+                    try:
+                        parsed = json.loads(response)
+                        if isinstance(parsed, dict) and 'answer' in parsed:
+                            response = parsed['answer']
+                    except:
+                        pass
+                
+                # Remove common prefixes/suffixes
+                response = re.sub(r'^(Answer:|ANSWER:|Response:)\s*', '', response, flags=re.IGNORECASE)
+                response = re.sub(r'\s*\.$', '', response)  # Remove trailing period if it's the only punctuation
+                
+                return response.strip()
+                
+            except Exception as e:
+                print(f"Error processing question '{question}': {str(e)}")
+                return "Error processing the question. Please try again."
+        
+        # Execute all questions concurrently
+        tasks = [process_question(q, emb) for q, emb in zip(request.questions, question_embeddings)]
+        answers = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Handle any exceptions in the results
+        final_answers = []
+        for i, answer in enumerate(answers):
+            if isinstance(answer, Exception):
+                print(f"Exception for question {i}: {str(answer)}")
+                final_answers.append("Error processing the question. Please try again.")
+            else:
+                final_answers.append(str(answer))
+
+        return QueryResponse(answers=final_answers)
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Unexpected error in run_query: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+# ---- Health check endpoint ----
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "model_info": {"embedding": "cohere-v3", "llm": "gemini-2.0-flash-exp"}}
 
 # ---- Cleanup function for executors ----
 @app.on_event("shutdown")
