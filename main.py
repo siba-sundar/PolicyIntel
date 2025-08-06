@@ -27,6 +27,7 @@ from PIL import Image
 import pytesseract
 import docx
 from docx import Document
+import requests
 
 # ---- Setup Logging ----
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +43,8 @@ GEMINI_API_KEY_3 = os.getenv("GEMINI_API_KEY_3")
 # ---- API Key Rotation Setup ----
 GEMINI_API_KEYS = [GEMINI_API_KEY_1, GEMINI_API_KEY_2, GEMINI_API_KEY_3]
 GEMINI_API_KEYS = [key for key in GEMINI_API_KEYS if key is not None]
+
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
 
 if not COHERE_API_KEY or not GEMINI_API_KEYS:
     logger.error("Missing API keys. Check COHERE_API_KEY and GEMINI_API_KEY environment variables.")
@@ -287,7 +290,7 @@ def parse_powerpoint(file_content: bytes) -> str:
                         image_stream = shape.image.blob
                         
                         # Process with OCR
-                        ocr_text = process_image_ocr(image_stream, f"slide_{slide_num}_image")
+                        ocr_text = process_image_ocr_space(image_stream, f"slide_{slide_num}_image")
                         
                         if ocr_text and ocr_text.strip() and "failed" not in ocr_text.lower():
                             slide_text.append(f"IMAGE_TEXT: {ocr_text.strip()}")
@@ -319,7 +322,20 @@ def parse_powerpoint(file_content: bytes) -> str:
     except Exception as e:
         logger.error(f"PowerPoint parsing failed: {str(e)}")
         raise Exception(f"PowerPoint parsing failed: {str(e)}")
-
+    
+def process_image_ocr_space(image_bytes: bytes, image_name: str) -> str:
+    try:
+        response = requests.post(
+            url='https://api.ocr.space/parse/image',
+            files={'filename': (image_name + '.jpg', image_bytes)},
+            data={'apikey': OCR_SPACE_API_KEY, 'language': 'eng'}
+        )
+        result = response.json()
+        return result['ParsedResults'][0]['ParsedText'] if 'ParsedResults' in result else ''
+    except Exception as e:
+        return f"[OCR Failed: {str(e)}]"
+    
+    
 # ---- Word Document Parser ----
 def parse_word_document(file_content: bytes) -> str:
     """Parse Word documents"""
