@@ -29,50 +29,29 @@ import docx
 from docx import Document
 import requests
 
+from app.services.chunking import get_enhanced_chunks
+from app.services.faiss_search import FAISSSearchService
+from app.config.settings import (
+    COHERE_API_KEY, GEMINI_API_KEYS, OCR_SPACE_API_KEY, TEAM_TOKEN,
+    REQUESTS_PER_KEY, MAX_FILE_SIZE, MAX_IMAGE_SIZE, OCR_BATCH_SIZE,
+    SUPPORTED_FORMATS, UNSUPPORTED_FORMATS, FAISS_K_SEARCH,
+    GEMINI_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_TOP_P, LLM_TOP_K,
+    COHERE_MODEL, EMBEDDING_BATCH_SIZE, EMBEDDING_MAX_LENGTH
+)
+
 # ---- Setup Logging ----
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---- Load API Keys ----
-load_dotenv()
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
-GEMINI_API_KEY_1 = os.getenv("GEMINI_API_KEY_1")
-GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2")
-GEMINI_API_KEY_3 = os.getenv("GEMINI_API_KEY_3")
-
-# ---- API Key Rotation Setup ----
-GEMINI_API_KEYS = [GEMINI_API_KEY_1, GEMINI_API_KEY_2, GEMINI_API_KEY_3]
-GEMINI_API_KEYS = [key for key in GEMINI_API_KEYS if key is not None]
-
-OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
-
-if not COHERE_API_KEY or not GEMINI_API_KEYS:
-    logger.error("Missing API keys. Check COHERE_API_KEY and GEMINI_API_KEY environment variables.")
-    raise ValueError("Missing required API keys")
-
 # Global variables for API key rotation
 current_key_index = 0
 request_count = 0
-REQUESTS_PER_KEY = 12
 
 # ---- Global array to store Q&A pairs ----
 qa_storage = []
 
-# ---- Supported File Formats ----
-SUPPORTED_FORMATS = {
-    'pdf', 'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'webp',
-    'xlsx', 'xls', 'pptx', 'ppt', 'docx', 'doc', 'txt', 'zip'
-}
-
-UNSUPPORTED_FORMATS = {
-    'exe', 'bat', 'sh', 'dll', 'sys', 'bin', 'iso', 'dmg',
-    'mp4', 'avi', 'mov', 'mp3', 'wav', 'flac', 'mkv'
-}
-
-# Memory management settings
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
-MAX_IMAGE_SIZE = (2048, 2048)  # Resize large images
-OCR_BATCH_SIZE = 5  # Process images in small batches
+# Initialize FAISS search service
+faiss_service = FAISSSearchService()
 
 def get_current_gemini_key():
     """Get current Gemini API key and handle rotation"""
@@ -97,8 +76,6 @@ async def health_check():
     """Health check endpoint for Render deployment"""
     return {"status": "healthy", "service": "PolicyIntel API", "version": "1.0.0"}
 
-# ---- Auth Token ----
-TEAM_TOKEN = "833695cad1c0d2600066bf2b08aab7614d0dec93b4b6f0ae3acd37ef7d6fcb1c"
 
 # ---- Data Models ----
 class QueryRequest(BaseModel):
@@ -575,43 +552,7 @@ async def download_and_process_document(url: str) -> str:
         logger.error(f"Document download/processing failed: {str(e)}")
         raise Exception(f"Download or processing failed: {str(e)}")
 
-# ---- Keep all existing functions unchanged ----
-def split_text_into_chunks(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
-    start_time = time.time()
-    logger.info("Starting enhanced text chunking")
-    
-    text = re.sub(r'\s+', ' ', text.strip())
-    
-    sentences = []
-    sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z])'
-    raw_sentences = re.split(sentence_pattern, text)
-    
-    for sentence in raw_sentences:
-        sentence = sentence.strip()
-        if len(sentence) > 15:
-            sentences.append(sentence)
-    
-    logger.info(f"Split into {len(sentences)} sentences")
-    
-    chunks = []
-    words = text.split()
-    
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk_words = words[i:i + chunk_size]
-        if len(chunk_words) >= 20:
-            chunk_text = " ".join(chunk_words)
-            if len(chunk_text) < len(text) and not chunk_text.endswith(('.', '!', '?')):
-                next_words = words[i + chunk_size:i + chunk_size + 20]
-                if next_words:
-                    extended = " ".join(chunk_words + next_words)
-                    next_boundary = extended.find('.', len(chunk_text))
-                    if next_boundary != -1 and next_boundary < len(chunk_text) + 100:
-                        chunk_text = extended[:next_boundary + 1]
-            
-            chunks.append(chunk_text)
-    
-    logger.info(f"Created {len(chunks)} enhanced chunks in {time.time() - start_time:.2f}s")
-    return chunks
+# ---- Enhanced Embeddings and Search ----
 
 async def get_embeddings(texts: List[str], input_type: str = "search_document") -> List[List[float]]:
     start_time = time.time()
@@ -628,24 +569,22 @@ async def get_embeddings(texts: List[str], input_type: str = "search_document") 
     for text in texts:
         if text.strip():
             converted_text = words_to_numbers(text)
-            clean_text = re.sub(r'\s+', ' ', converted_text.strip())[:2000]
+            clean_text = re.sub(r'\s+', ' ', converted_text.strip())[:EMBEDDING_MAX_LENGTH]
             clean_texts.append(clean_text)
     
     if not clean_texts:
         raise ValueError("No valid texts provided for embedding")
-
-    BATCH_SIZE = 96
     all_embeddings = []
     
     timeout = httpx.Timeout(45.0)
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
     
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-        for i in range(0, len(clean_texts), BATCH_SIZE):
-            batch = clean_texts[i:i+BATCH_SIZE]
+        for i in range(0, len(clean_texts), EMBEDDING_BATCH_SIZE):
+            batch = clean_texts[i:i+EMBEDDING_BATCH_SIZE]
             
             data = {
-                "model": "embed-english-v3.0",
+                "model": COHERE_MODEL,
                 "texts": batch,
                 "input_type": input_type,
                 "truncate": "END"
@@ -669,76 +608,12 @@ async def get_embeddings(texts: List[str], input_type: str = "search_document") 
                     response.raise_for_status()
                     
             except Exception as e:
-                logger.error(f"Embedding batch {i//BATCH_SIZE + 1} failed: {str(e)}")
+                logger.error(f"Embedding batch {i//EMBEDDING_BATCH_SIZE + 1} failed: {str(e)}")
                 raise e
     
     logger.info(f"Got {len(all_embeddings)} embeddings in {time.time() - start_time:.2f}s")
     return all_embeddings
 
-def cosine_similarity_batch(query_vec: List[float], chunk_embeddings: List[List[float]]) -> List[float]:
-    """Vectorized cosine similarity for speed"""
-    query_arr = np.array(query_vec, dtype=np.float32)
-    chunk_arr = np.array(chunk_embeddings, dtype=np.float32)
-    similarities = np.dot(chunk_arr, query_arr)
-    return similarities.tolist()
-
-async def search_similar_chunks(query_embedding: List[float], chunk_embeddings: List[List[float]], 
-                               chunks: List[str], question: str, k=15) -> List[str]:
-    start_time = time.time()
-    
-    similarities = cosine_similarity_batch(query_embedding, chunk_embeddings)
-    max_similarity = max(similarities) if similarities else 0
-    
-    key_terms = extract_key_terms(question.lower())
-    question_lower = question.lower()
-    
-    scored_chunks = []
-    
-    for i, sim_score in enumerate(similarities):
-        chunk = chunks[i]
-        chunk_lower = chunk.lower()
-        
-        keyword_score = 0
-        if key_terms:
-            exact_matches = sum(1 for term in key_terms if f" {term} " in f" {chunk_lower} ")
-            partial_matches = sum(1 for term in key_terms if term in chunk_lower and f" {term} " not in f" {chunk_lower} ")
-            
-            numeric_matches = 0
-            for term in key_terms:
-                if re.search(r'\d', term):
-                    if term in chunk_lower:
-                        numeric_matches += 2
-            
-            keyword_score = (exact_matches * 0.25 + partial_matches * 0.1 + numeric_matches * 0.15) / len(key_terms)
-        
-        question_words = set(re.findall(r'\b\w+\b', question_lower))
-        chunk_words = set(re.findall(r'\b\w+\b', chunk_lower))
-        overlap_score = len(question_words.intersection(chunk_words)) / len(question_words) * 0.15
-        
-        final_score = sim_score + keyword_score + overlap_score
-        scored_chunks.append((i, chunk, final_score, sim_score))
-    
-    scored_chunks.sort(key=lambda x: x[2], reverse=True)
-    
-    if max_similarity < 0.25:
-        logger.warning(f"🔍 Low semantic similarity ({max_similarity:.3f}) - enhancing with keyword search")
-        keyword_boosted = []
-        for i, chunk, final_score, sem_score in scored_chunks:
-            if any(term in chunk.lower() for term in key_terms):
-                keyword_boosted.append((i, chunk, final_score + 0.4, sem_score))
-            else:
-                keyword_boosted.append((i, chunk, final_score, sem_score))
-        
-        keyword_boosted.sort(key=lambda x: x[2], reverse=True)
-        scored_chunks = keyword_boosted
-    
-    result_chunks = []
-    for idx, (chunk_idx, chunk, final_score, sem_score) in enumerate(scored_chunks[:k]):
-        indexed_chunk = f"[CONTEXT {idx+1}] {chunk}"
-        result_chunks.append(indexed_chunk)
-    
-    logger.info(f"Similarity search completed in {time.time() - start_time:.2f}s. Max sim: {max_similarity:.3f}")
-    return result_chunks
 
 def extract_key_terms(question: str) -> List[str]:
     important_terms = {
@@ -769,7 +644,7 @@ def is_yes_no_question(question: str) -> bool:
     return question_lower.startswith(('is ', 'are ', 'do ', 'does ', 'did ', 'will ', 'would ', 'can ', 'could '))
 
 def build_prompt(question: str, context_chunks: List[str]) -> str:
-    context = "\n\n---\n\n".join(context_chunks[:12])
+    context = "\n\n---\n\n".join(context_chunks[:15])  # Focused context for reasoning
     
     is_yes_no = is_yes_no_question(question)
     key_terms = extract_key_terms(question.lower())
@@ -777,42 +652,33 @@ def build_prompt(question: str, context_chunks: List[str]) -> str:
     hints = ""
     if key_terms:
         hints = f"""
-**KEY TERMS TO LOOK FOR:** {", ".join(key_terms[:10])}
+**KEY TERMS TO LOOK FOR:** {", ".join(key_terms[:15])}
 (The above terms from your question should help identify relevant information in the context below)
 """
     
     if is_yes_no:
         response_instruction = """This is a yes/no question. Start your response with "Yes" or "No", then provide a brief explanation with specific details from the context in 25-40 words total."""
     else:
-        response_instruction = """Answer in ONE concise, direct paragraph (30-60 words maximum). Include specific numbers, amounts, percentages, and conditions from the context. Use figures (1, 2, 3) instead of words (one, two, three) for all numbers."""
+        response_instruction = """Answer in ONE concise, direct paragraph (40-80 words maximum). Include specific numbers, amounts, percentages, and conditions from the context. Use figures (1, 2, 3) instead of words (one, two, three) for all numbers."""
 
-    return f"""You are an expert document analyst. Analyze the provided context carefully and provide precise answers.
+    return f"""You are an intelligent insurance analyst who understands policy documents and can reason about their content. Read the context carefully and provide thoughtful, accurate answers.
 
-**CRITICAL INSTRUCTIONS:**
-1. {response_instruction}
-2. ALWAYS quote specific numbers, percentages, dollar amounts, limits, and conditions from the context
-3. Look for information across ALL context sections - scan every section thoroughly
-4. If you find partial information, state what you found and note what's missing
-5. Include exceptions, sub-limits, waiting periods, or special conditions when mentioned
-6. Use simple, clear language without markdown formatting
-7. ALWAYS use numeric figures (1, 2, 50, 100) never spell out numbers as words
-8. Only say "The information is not available in the provided context" if NONE of the context sections contain any relevant information about the topic
+**YOUR TASK:** {response_instruction}
 
-**ANALYSIS APPROACH:**
-- Scan each [CONTEXT X] section thoroughly for relevant information
-- Look for the key terms mentioned above AND related concepts
-- Cross-reference information between sections
-- Pay special attention to numbers, amounts, percentages, and conditions
-- Consider partial matches and related information
+**REASONING APPROACH:**
+1. Read and understand the context thoroughly
+2. Think about how the information relates to the question
+3. Consider the logical connections between different pieces of information
+4. Provide answers based on understanding, not just keyword matching
+5. Include specific numbers, dates, amounts, and conditions when relevant
+6. If information is partially available, explain what you can determine and what is missing
 
-{hints}
-
-**DOCUMENT CONTEXT:**
+**CONTEXT TO ANALYZE:**
 {context}
 
 **QUESTION:** {question}
 
-**ANSWER:**"""
+**ANSWER (provide a thoughtful, reasoned response based on the context):**"""
 
 async def ask_llm(prompt: str, retry_count: int = 0) -> str:
     try:
@@ -822,15 +688,15 @@ async def ask_llm(prompt: str, retry_count: int = 0) -> str:
         start_time = time.time()
         
         genai.configure(api_key=current_api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash-lite')
+        model = genai.GenerativeModel(GEMINI_MODEL)
         
         response = model.generate_content(
             prompt,
             generation_config=genai.types.GenerationConfig(
-                temperature=0.1,
-                max_output_tokens=180,
-                top_p=0.9,
-                top_k=25,
+                temperature=LLM_TEMPERATURE,
+                max_output_tokens=LLM_MAX_TOKENS,
+                top_p=LLM_TOP_P,
+                top_k=LLM_TOP_K,
             )
         )
         
@@ -901,20 +767,26 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
         if not document_text.strip():
             logger.error("No text extracted from document")
             raise HTTPException(status_code=400, detail="No text could be extracted from the document")
-            
-        chunks = split_text_into_chunks(document_text)
+        
+        # Use improved semantic chunking
+        chunks = get_enhanced_chunks(document_text)
         if not chunks:
             logger.error("No chunks created from document")
             raise HTTPException(status_code=400, detail="No meaningful chunks could be created from the document")
-            
+        
         # Clear document text from memory after chunking
         del document_text
         clear_memory()
         
-        # Get embeddings
+        # Get embeddings for chunks and questions
         logger.info("Getting embeddings")
-        chunk_embeddings = await get_embeddings(chunks, input_type="search_document")
+        chunk_texts = [chunk["text"] for chunk in chunks]
+        chunk_embeddings = await get_embeddings(chunk_texts, input_type="search_document")
         question_embeddings = await get_embeddings(request.questions, input_type="search_query")
+        
+        # Create FAISS index with chunk embeddings
+        logger.info("Creating FAISS index")
+        faiss_service.create_index(chunk_embeddings, chunks)
         
         # Process questions
         logger.info("Processing questions")
@@ -923,13 +795,24 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
             try:
                 logger.info(f"Processing question {i+1}/{len(request.questions)}: {question[:50]}...")
                 
-                relevant_chunks = await search_similar_chunks(q_emb, chunk_embeddings, chunks, question)
-                if not relevant_chunks:
+                # Use multi-tier FAISS search for comprehensive results
+                search_results = faiss_service.multi_tier_search(q_emb, question, FAISS_K_SEARCH)
+                
+                # Optional enhanced search (only if USE_ENHANCED_SEARCH=true)
+                from app.services.enhanced_search import apply_enhanced_search_if_enabled
+                search_results = apply_enhanced_search_if_enabled(search_results, question)
+                
+                if not search_results:
+                    logger.warning(f"No search results found for question: {question}")
                     answer = "The information is not available in the provided context."
                     answers.append(answer)
                     qa_storage.append([question, answer])
                     continue
-                    
+                
+                # Enhance and format results
+                relevant_chunks = faiss_service.enhance_results(search_results, question)
+                
+                # Build prompt and get answer
                 prompt = build_prompt(question, relevant_chunks)
                 response = await ask_llm(prompt)
                 
@@ -941,12 +824,10 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
                 final_answer = response.strip()
                 answers.append(final_answer)
                 
-                # Store Q&A pair in nested array format
+                # Store Q&A pair
                 qa_storage.append([question, final_answer])
                 
                 logger.info(f"Question {i+1} processed successfully")
-                
-                # Memory cleanup after each question
                 clear_memory()
                 
             except Exception as e:
@@ -954,17 +835,14 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
                 error_answer = "Error processing the question. Please try again."
                 answers.append(error_answer)
                 qa_storage.append([question, error_answer])
-
+        
         total_time = time.time() - total_start_time
         logger.info(f"Total request processed in {total_time:.2f}s")
         
-        # Log all Q&A pairs after successful execution
+        # Log Q&A pairs and clear storage
         logger.info("📋 ALL QUESTIONS AND ANSWERS:")
         logger.info(f"{qa_storage}")
-        
-        # Empty the array after printing to save space
         qa_storage.clear()
-        logger.info("✅ Q&A storage cleared to save memory")
         
         return QueryResponse(answers=answers)
         
@@ -977,17 +855,26 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
 
 @app.get("/health")
 async def health_check():
+    faiss_stats = faiss_service.get_stats()
     return {
         "status": "healthy", 
         "memory_usage": "optimized", 
-        "version": "enhanced_multi_format_with_excel_headers",
+        "version": "enhanced_faiss_chunking_v2.0",
         "supported_formats": list(SUPPORTED_FORMATS),
         "unsupported_formats": list(UNSUPPORTED_FORMATS),
         "api_keys_available": len(GEMINI_API_KEYS),
         "current_key": current_key_index + 1,
         "requests_on_current_key": request_count,
         "qa_storage_size": len(qa_storage),
-        "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024)
+        "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024),
+        "faiss_index": faiss_stats,
+        "enhanced_features": {
+            "semantic_chunking": True,
+            "topic_based_chunking": True,
+            "hybrid_search": True,
+            "faiss_indexing": True,
+            "quality_scoring": True
+        }
     }
 
 @app.get("/api-status")
@@ -1001,6 +888,29 @@ async def api_status():
         "qa_storage_current_size": len(qa_storage),
         "supported_formats": list(SUPPORTED_FORMATS),
         "memory_limit_mb": MAX_FILE_SIZE / (1024 * 1024)
+    }
+
+@app.get("/faiss-stats")
+async def faiss_statistics():
+    """Endpoint to check FAISS index statistics"""
+    stats = faiss_service.get_stats()
+    return {
+        "faiss_index_info": stats,
+        "search_capabilities": {
+            "semantic_search": True,
+            "keyword_search": stats.get("tfidf_available", False),
+            "hybrid_search": True,
+            "domain_specific_boosting": True,
+            "numeric_matching": True,
+            "phrase_matching": True
+        },
+        "chunking_strategies": {
+            "sliding_window": True,
+            "semantic_chunking": True,
+            "topic_based_chunking": True,
+            "structured_chunking": True,
+            "quality_ranking": True
+        }
     }
 
 @app.get("/supported-formats")
@@ -1021,7 +931,13 @@ async def supported_formats():
             "nested_zip_extraction": True,
             "image_ocr": True,
             "memory_optimized": True,
-            "format_validation": True
+            "format_validation": True,
+            "faiss_search": True,
+            "hybrid_retrieval": True,
+            "semantic_chunking": True,
+            "topic_based_chunking": True,
+            "quality_scoring": True,
+            "enhanced_precision": True
         }
     }
 

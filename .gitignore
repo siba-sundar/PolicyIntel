@@ -71,3 +71,4 @@ htmlcov/
 *.xlsx
 *.pptx
 !p-1.pdf
+.vercel
