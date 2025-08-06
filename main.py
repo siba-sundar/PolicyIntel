@@ -253,6 +253,7 @@ def parse_powerpoint(file_content: bytes) -> str:
     try:
         presentation = Presentation(io.BytesIO(file_content))
         all_text_parts = []
+        image_batch = []
         
         for slide_num, slide in enumerate(presentation.slides, 1):
             slide_text_parts = [f"=== SLIDE {slide_num} ==="]
@@ -804,13 +805,12 @@ async def ask_llm(prompt: str, retry_count: int = 0) -> str:
         
         start_time = time.time()
         
-        client = genai.Client(api_key=current_api_key)
-        from google.genai import types
+        genai.configure(api_key=current_api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash-lite')
         
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite", 
-            contents=prompt,
-            config=types.GenerateContentConfig(
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
                 temperature=0.1,
                 max_output_tokens=180,
                 top_p=0.9,
