@@ -3,7 +3,7 @@ from pydantic import BaseModel
 import httpx
 import asyncio
 import fitz  # PyMuPDF
-from google import genai
+import google.generativeai as genai
 import os
 from dotenv import load_dotenv
 from typing import List, Dict, Optional, Tuple
