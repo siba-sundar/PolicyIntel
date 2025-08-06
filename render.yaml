@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: policyintel-api
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: |
+      apt-get update
+      apt-get install -y tesseract-ocr tesseract-ocr-eng
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: COHERE_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY_1
+        sync: false
+      - key: GEMINI_API_KEY_2
+        sync: false
+      - key: GEMINI_API_KEY_3
+        sync: false

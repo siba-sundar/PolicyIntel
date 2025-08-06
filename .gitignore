@@ -1,6 +1,73 @@
-venv
-temp.txt 
-__pycache__
-.env
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+PYTHONPATH
 
-round3.txt
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Temporary files and directories
+temp/
+tmp/
+*.tmp
+*.temp
+.temp/
+.tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Documents (if temporary)
+*.pdf
+*.docx
+*.xlsx
+*.pptx
+!p-1.pdf
