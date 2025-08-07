@@ -18,6 +18,7 @@ import zipfile
 import io
 from pathlib import Path
 import gc
+import psutil
 
 # New imports for additional formats
 import openpyxl
@@ -86,9 +87,62 @@ class QueryResponse(BaseModel):
     answers: List[str]
 
 # ---- Memory Management Utilities ----
-def clear_memory():
-    """Force garbage collection to free memory"""
-    gc.collect()
+def get_memory_usage():
+    """Get current memory usage information"""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_percent = process.memory_percent()
+    system_memory = psutil.virtual_memory()
+    
+    return {
+        "process_memory_mb": round(memory_info.rss / 1024 / 1024, 2),
+        "process_memory_percent": round(memory_percent, 2),
+        "system_memory_total_gb": round(system_memory.total / 1024 / 1024 / 1024, 2),
+        "system_memory_available_gb": round(system_memory.available / 1024 / 1024 / 1024, 2),
+        "system_memory_used_percent": round(system_memory.percent, 2)
+    }
+
+def log_memory_usage(stage: str = ""):
+    """Log current memory usage with optional stage description"""
+    try:
+        memory_info = get_memory_usage()
+        stage_text = f" ({stage})" if stage else ""
+        logger.info(f"📊 Memory Usage{stage_text}: {memory_info['process_memory_mb']}MB ({memory_info['process_memory_percent']}% of system)")
+        return memory_info
+    except Exception as e:
+        logger.warning(f"Failed to get memory usage: {e}")
+        return {}
+
+def clear_memory(stage: str = ""):
+    """Force garbage collection and log memory usage"""
+    # Log memory before cleanup
+    memory_before = get_memory_usage()
+    
+    # Force garbage collection
+    collected = gc.collect()
+    
+    # Log memory after cleanup
+    memory_after = get_memory_usage()
+    
+    # Calculate savings
+    if memory_before and memory_after:
+        memory_saved = memory_before['process_memory_mb'] - memory_after['process_memory_mb']
+        stage_text = f" ({stage})" if stage else ""
+        if memory_saved > 0:
+            logger.info(f"🧹 Memory Cleanup{stage_text}: Freed {memory_saved:.2f}MB, collected {collected} objects")
+        else:
+            logger.info(f"🧹 Memory Cleanup{stage_text}: {memory_after['process_memory_mb']}MB used, collected {collected} objects")
+    
+    return collected
+
+def cleanup_variables(*variables):
+    """Cleanup specific variables and force garbage collection"""
+    for var in variables:
+        try:
+            del var
+        except:
+            pass
+    return clear_memory("variables cleanup")
 
 def get_file_extension(filename: str) -> str:
     """Extract file extension safely"""
@@ -210,9 +264,9 @@ def parse_excel_with_headers(file_content: bytes) -> str:
             all_text_parts.extend(sheet_text_parts)
             all_text_parts.append("\n" + "="*50 + "\n")
             
-            # Memory cleanup
-            del data_rows
-            clear_memory()
+            # Memory cleanup with enhanced logging
+            cleanup_variables(data_rows)
+            clear_memory(f"Excel sheet {sheet_name}")
         
         workbook.close()
         final_text = "\n".join(all_text_parts)
@@ -289,8 +343,8 @@ def parse_powerpoint(file_content: bytes) -> str:
             
             # Memory management - process slides in batches
             if slide_num % 10 == 0:  # More frequent cleanup due to image processing
-                clear_memory()
-                logger.info(f"Processed {slide_num} slides so far...")
+                clear_memory(f"PowerPoint batch after slide {slide_num}")
+                log_memory_usage(f"PowerPoint progress: {slide_num} slides")
         
         final_text = "\n\n".join(all_text_parts)
         logger.info(f"PowerPoint parsing completed in {time.time() - start_time:.2f}s. Text length: {len(final_text)} characters")
@@ -374,7 +428,8 @@ def process_image_ocr(image_content: bytes, filename: str = "") -> str:
         
         # Clean up image from memory
         image.close()
-        clear_memory()
+        cleanup_variables(image)
+        clear_memory("OCR image processing")
         
         # Clean extracted text
         cleaned_text = re.sub(r'\s+', ' ', extracted_text.strip())
@@ -732,14 +787,23 @@ async def ask_llm(prompt: str, retry_count: int = 0) -> str:
     
 @app.get("/")
 async def root():
+    memory_info = get_memory_usage()
     return {
-        "message": "Enhanced Multi-Format Document Processor Running", 
-        "status": "enhanced_multi_format_support",
+        "message": "Enhanced Multi-Format Document Processor with Memory Optimization", 
+        "status": "memory_optimized_v2.1",
         "supported_formats": list(SUPPORTED_FORMATS),
         "api_keys_count": len(GEMINI_API_KEYS),
         "current_key_index": current_key_index + 1,
         "requests_on_current_key": request_count,
-        "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024)
+        "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024),
+        "current_memory_usage_mb": memory_info.get('process_memory_mb', 0),
+        "memory_optimization": "render_free_tier_ready",
+        "endpoints": {
+            "main": "/hackrx/run",
+            "health": "/health", 
+            "memory_status": "/memory-status",
+            "api_status": "/api-status"
+        }
     }
 
 @app.post("/hackrx/run", response_model=QueryResponse)
@@ -747,7 +811,10 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
     global qa_storage
     
     total_start_time = time.time()
-    logger.info(f"Received request with {len(request.questions)} questions")
+    
+    # Log initial memory state
+    initial_memory = log_memory_usage("Request start")
+    logger.info(f"📥 Received request with {len(request.questions)} questions")
     
     # Auth check
     if not authorization or not authorization.startswith("Bearer "):
@@ -761,39 +828,54 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
 
     try:
         # Process document with enhanced multi-format support
-        logger.info("Starting enhanced document processing")
+        logger.info("📄 Starting enhanced document processing")
+        log_memory_usage("Before document processing")
+        
         document_text = await download_and_process_document(request.documents)
+        log_memory_usage("After document download")
         
         if not document_text.strip():
             logger.error("No text extracted from document")
             raise HTTPException(status_code=400, detail="No text could be extracted from the document")
         
         # Use improved semantic chunking
+        logger.info("🧩 Starting document chunking")
         chunks = get_enhanced_chunks(document_text)
+        log_memory_usage("After chunking")
+        
         if not chunks:
             logger.error("No chunks created from document")
             raise HTTPException(status_code=400, detail="No meaningful chunks could be created from the document")
         
         # Clear document text from memory after chunking
-        del document_text
-        clear_memory()
+        cleanup_variables(document_text)
+        clear_memory("Document text cleanup")
         
         # Get embeddings for chunks and questions
-        logger.info("Getting embeddings")
+        logger.info("🤖 Getting embeddings")
         chunk_texts = [chunk["text"] for chunk in chunks]
         chunk_embeddings = await get_embeddings(chunk_texts, input_type="search_document")
+        log_memory_usage("After chunk embeddings")
+        
         question_embeddings = await get_embeddings(request.questions, input_type="search_query")
+        log_memory_usage("After question embeddings")
+        
+        # Cleanup intermediate variables
+        cleanup_variables(chunk_texts)
+        clear_memory("Embeddings cleanup")
         
         # Create FAISS index with chunk embeddings
-        logger.info("Creating FAISS index")
+        logger.info("📊 Creating FAISS index")
         faiss_service.create_index(chunk_embeddings, chunks)
+        log_memory_usage("After FAISS index creation")
         
         # Process questions
-        logger.info("Processing questions")
+        logger.info("❓ Processing questions")
         answers = []
         for i, (question, q_emb) in enumerate(zip(request.questions, question_embeddings)):
             try:
-                logger.info(f"Processing question {i+1}/{len(request.questions)}: {question[:50]}...")
+                logger.info(f"📝 Processing question {i+1}/{len(request.questions)}: {question[:50]}...")
+                question_start_memory = log_memory_usage(f"Question {i+1} start")
                 
                 # Use multi-tier FAISS search for comprehensive results
                 search_results = faiss_service.multi_tier_search(q_emb, question, FAISS_K_SEARCH)
@@ -827,8 +909,12 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
                 # Store Q&A pair
                 qa_storage.append([question, final_answer])
                 
-                logger.info(f"Question {i+1} processed successfully")
-                clear_memory()
+                # Cleanup question-specific variables
+                cleanup_variables(search_results, relevant_chunks, prompt, response)
+                
+                logger.info(f"✅ Question {i+1} processed successfully")
+                clear_memory(f"Question {i+1} completion")
+                log_memory_usage(f"Question {i+1} end")
                 
             except Exception as e:
                 logger.error(f"Error processing question {i+1} '{question}': {str(e)}")
@@ -836,13 +922,26 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
                 answers.append(error_answer)
                 qa_storage.append([question, error_answer])
         
+        # Final cleanup of major variables
+        cleanup_variables(chunks, chunk_embeddings, question_embeddings)
+        
         total_time = time.time() - total_start_time
-        logger.info(f"Total request processed in {total_time:.2f}s")
+        final_memory = log_memory_usage("Request completion")
+        
+        # Calculate memory usage statistics
+        if initial_memory and final_memory:
+            memory_delta = final_memory['process_memory_mb'] - initial_memory['process_memory_mb']
+            logger.info(f"📊 Memory Delta: {memory_delta:+.2f}MB from start to finish")
+        
+        logger.info(f"⏱️ Total request processed in {total_time:.2f}s")
         
         # Log Q&A pairs and clear storage
         logger.info("📋 ALL QUESTIONS AND ANSWERS:")
         logger.info(f"{qa_storage}")
         qa_storage.clear()
+        
+        # Final comprehensive memory cleanup
+        clear_memory("Complete request cleanup")
         
         return QueryResponse(answers=answers)
         
@@ -856,10 +955,11 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
 @app.get("/health")
 async def health_check():
     faiss_stats = faiss_service.get_stats()
+    memory_info = get_memory_usage()
     return {
         "status": "healthy", 
-        "memory_usage": "optimized", 
-        "version": "enhanced_faiss_chunking_v2.0",
+        "memory_usage": memory_info, 
+        "version": "enhanced_memory_optimized_v2.1",
         "supported_formats": list(SUPPORTED_FORMATS),
         "unsupported_formats": list(UNSUPPORTED_FORMATS),
         "api_keys_available": len(GEMINI_API_KEYS),
@@ -875,6 +975,27 @@ async def health_check():
             "faiss_indexing": True,
             "quality_scoring": True
         }
+    }
+
+@app.get("/memory-status")
+async def memory_status():
+    """Endpoint to check current memory usage and perform cleanup"""
+    # Get memory before cleanup
+    memory_before = get_memory_usage()
+    
+    # Force cleanup
+    collected = clear_memory("Memory status check")
+    
+    # Get memory after cleanup
+    memory_after = get_memory_usage()
+    
+    return {
+        "memory_before_cleanup": memory_before,
+        "memory_after_cleanup": memory_after,
+        "objects_collected": collected,
+        "cleanup_performed": True,
+        "memory_freed_mb": round(memory_before.get('process_memory_mb', 0) - memory_after.get('process_memory_mb', 0), 2) if memory_before and memory_after else 0,
+        "render_free_tier_optimized": True
     }
 
 @app.get("/api-status")
