@@ -19,6 +19,9 @@ import io
 from pathlib import Path
 import gc
 import psutil
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # New imports for additional formats
 import openpyxl
@@ -33,11 +36,12 @@ import requests
 from app.services.chunking import get_enhanced_chunks
 from app.services.faiss_search import FAISSSearchService
 from app.config.settings import (
-    COHERE_API_KEY, GEMINI_API_KEYS, OCR_SPACE_API_KEY, TEAM_TOKEN,
+    COHERE_API_KEYS, GEMINI_API_KEYS, OCR_SPACE_API_KEY, TEAM_TOKEN,
     REQUESTS_PER_KEY, MAX_FILE_SIZE, MAX_IMAGE_SIZE, OCR_BATCH_SIZE,
     SUPPORTED_FORMATS, UNSUPPORTED_FORMATS, FAISS_K_SEARCH,
     GEMINI_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_TOP_P, LLM_TOP_K,
-    COHERE_MODEL, EMBEDDING_BATCH_SIZE, EMBEDDING_MAX_LENGTH
+    COHERE_MODEL, EMBEDDING_BATCH_SIZE, EMBEDDING_MAX_LENGTH,
+    MAX_WORKERS, PARALLEL_CHUNK_SIZE, PARALLEL_OCR_BATCH, PARALLEL_EMBEDDING_CONCURRENT
 )
 
 # ---- Setup Logging ----
@@ -45,8 +49,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global variables for API key rotation
-current_key_index = 0
-request_count = 0
+current_gemini_key_index = 0
+gemini_request_count = 0
+current_cohere_key_index = 0
 
 # ---- Global array to store Q&A pairs ----
 qa_storage = []
@@ -56,17 +61,27 @@ faiss_service = FAISSSearchService()
 
 def get_current_gemini_key():
     """Get current Gemini API key and handle rotation"""
-    global current_key_index, request_count
+    global current_gemini_key_index, gemini_request_count
     
-    current_key = GEMINI_API_KEYS[current_key_index]
-    request_count += 1
+    current_key = GEMINI_API_KEYS[current_gemini_key_index]
+    gemini_request_count += 1
     
-    if request_count >= REQUESTS_PER_KEY:
-        request_count = 0
-        current_key_index = (current_key_index + 1) % len(GEMINI_API_KEYS)
-        logger.info(f"🔄 SWITCHED to Gemini API key #{current_key_index + 1}")
+    if gemini_request_count >= REQUESTS_PER_KEY:
+        gemini_request_count = 0
+        current_gemini_key_index = (current_gemini_key_index + 1) % len(GEMINI_API_KEYS)
+        logger.info(f"🔄 SWITCHED to Gemini API key #{current_gemini_key_index + 1}")
     
     return current_key
+
+def get_current_cohere_key():
+    """Get current Cohere API key for this request"""
+    return COHERE_API_KEYS[current_cohere_key_index]
+
+def rotate_cohere_key():
+    """Rotate to the next Cohere API key after a complete request"""
+    global current_cohere_key_index
+    current_cohere_key_index = (current_cohere_key_index + 1) % len(COHERE_API_KEYS)
+    logger.info(f"🔄 SWITCHED to Cohere API key #{current_cohere_key_index + 1}")
 
 app = FastAPI(title="PolicyIntel API", description="Document processing and Q&A API", version="1.0.0")
 
@@ -280,20 +295,21 @@ def parse_excel_with_headers(file_content: bytes) -> str:
 
 # ---- PowerPoint Parser ----
 def parse_powerpoint(file_content: bytes) -> str:
-    """Parse PowerPoint files extracting text and handling images with OCR"""
-    logger.info("Starting PowerPoint parsing with image OCR support")
+    """Parse PowerPoint files extracting text and handling images with parallel OCR"""
+    logger.info("Starting PowerPoint parsing with parallel image OCR support")
     start_time = time.time()
     
     try:
         presentation = Presentation(io.BytesIO(file_content))
         all_text_parts = []
-        image_batch = []
+        image_data_list = []  # Collect all images for parallel processing
+        slide_image_mapping = {}  # Track which images belong to which slides
         
+        # First pass: Extract text and collect images
         for slide_num, slide in enumerate(presentation.slides, 1):
             slide_text_parts = [f"=== SLIDE {slide_num} ==="]
-            
-            # Extract text from all text boxes and shapes
             slide_text = []
+            
             for shape in slide.shapes:
                 # Extract regular text
                 if hasattr(shape, 'text') and shape.text.strip():
@@ -312,39 +328,40 @@ def parse_powerpoint(file_content: bytes) -> str:
                             table_text.append(" | ".join(row_data))
                     slide_text.append("\n".join(table_text))
                 
-                # Handle images with OCR
+                # Collect images for parallel OCR processing
                 try:
                     if shape.shape_type == 13:  # Picture type
-                        logger.info(f"Found image in slide {slide_num}, processing with OCR")
-                        
-                        # Extract image bytes
                         image_stream = shape.image.blob
-                        
-                        # Process with OCR
-                        ocr_text = process_image_ocr_space(image_stream, f"slide_{slide_num}_image")
-                        
-                        if ocr_text and ocr_text.strip() and "failed" not in ocr_text.lower():
-                            slide_text.append(f"IMAGE_TEXT: {ocr_text.strip()}")
-                            logger.info(f"Successfully extracted text from image in slide {slide_num}")
-                        else:
-                            logger.info(f"No meaningful text found in image from slide {slide_num}")
-                            
+                        image_name = f"slide_{slide_num}_image_{len(image_data_list)}"
+                        image_data_list.append((image_stream, image_name))
+                        slide_image_mapping[len(image_data_list) - 1] = slide_num
+                        logger.info(f"Found image in slide {slide_num}, queued for parallel OCR")
                 except Exception as img_error:
-                    # Log but don't fail the entire slide processing
-                    logger.warning(f"Could not process image in slide {slide_num}: {str(img_error)}")
+                    logger.warning(f"Could not extract image from slide {slide_num}: {str(img_error)}")
                     continue
             
-            # Add slide content if we have any
+            # Store slide text
             if slide_text:
                 slide_text_parts.extend(slide_text)
-            
-            # Always add the slide (even if empty) to maintain structure
             all_text_parts.append("\n".join(slide_text_parts))
+        
+        # Process all images in parallel
+        if image_data_list:
+            logger.info(f"Processing {len(image_data_list)} images with parallel OCR")
+            ocr_results = process_images_parallel_ocr(image_data_list)
             
-            # Memory management - process slides in batches
-            if slide_num % 10 == 0:  # More frequent cleanup due to image processing
-                clear_memory(f"PowerPoint batch after slide {slide_num}")
-                log_memory_usage(f"PowerPoint progress: {slide_num} slides")
+            # Add OCR results to respective slides
+            for i, ocr_text in enumerate(ocr_results):
+                if i < len(image_data_list):
+                    slide_num = slide_image_mapping.get(i)
+                    if slide_num and ocr_text:
+                        # Find the slide in all_text_parts and append OCR text
+                        for j, slide_content in enumerate(all_text_parts):
+                            if f"=== SLIDE {slide_num} ===" in slide_content:
+                                all_text_parts[j] += f"\nIMAGE_TEXT: {ocr_text}"
+                                break
+            
+            logger.info(f"Parallel OCR completed, processed {len(ocr_results)} images successfully")
         
         final_text = "\n\n".join(all_text_parts)
         logger.info(f"PowerPoint parsing completed in {time.time() - start_time:.2f}s. Text length: {len(final_text)} characters")
@@ -365,6 +382,36 @@ def process_image_ocr_space(image_bytes: bytes, image_name: str) -> str:
         return result['ParsedResults'][0]['ParsedText'] if 'ParsedResults' in result else ''
     except Exception as e:
         return f"[OCR Failed: {str(e)}]"
+
+def process_images_parallel_ocr(image_data_list: List[Tuple[bytes, str]]) -> List[str]:
+    """Process multiple images with OCR in parallel"""
+    if not image_data_list:
+        return []
+    
+    logger.info(f"Processing {len(image_data_list)} images with parallel OCR")
+    ocr_results = []
+    
+    with ThreadPoolExecutor(max_workers=min(PARALLEL_OCR_BATCH, len(image_data_list))) as executor:
+        # Submit all OCR tasks
+        future_to_image = {
+            executor.submit(process_image_ocr_space, img_bytes, img_name): (img_bytes, img_name)
+            for img_bytes, img_name in image_data_list
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_image):
+            img_bytes, img_name = future_to_image[future]
+            try:
+                ocr_text = future.result()
+                if ocr_text and ocr_text.strip() and "failed" not in ocr_text.lower():
+                    ocr_results.append(ocr_text.strip())
+                    logger.info(f"Successfully extracted text from {img_name}")
+                else:
+                    logger.info(f"No meaningful text found in {img_name}")
+            except Exception as e:
+                logger.warning(f"OCR failed for {img_name}: {str(e)}")
+    
+    return ocr_results
     
     
 # ---- Word Document Parser ----
@@ -443,18 +490,20 @@ def process_image_ocr(image_content: bytes, filename: str = "") -> str:
 
 # ---- ZIP File Handler ----
 async def extract_and_process_zip(file_content: bytes, depth: int = 0) -> str:
-    """Extract and process ZIP files with limited recursion depth"""
-    MAX_ZIP_DEPTH = 2  # Maximum nesting depth for ZIP files
+    """Extract and process ZIP files - go only one level deep, choosing first ZIP if multiple found"""
+    MAX_ZIP_DEPTH = 1  # Only go one level deep
     
     if depth >= MAX_ZIP_DEPTH:
         logger.warning(f"ZIP nesting depth limit reached ({MAX_ZIP_DEPTH}). Skipping further extraction.")
-        return "No meaningful content found - ZIP nesting too deep (max 2 levels allowed)"
+        return "No meaningful content found - ZIP nesting too deep (max 1 level allowed)"
     
     logger.info(f"Starting ZIP file processing (depth level: {depth + 1})")
     start_time = time.time()
     
     all_extracted_text = []
     processed_files = []
+    nested_zips_found = []
+    first_nested_zip_processed = False
     
     try:
         with zipfile.ZipFile(io.BytesIO(file_content), 'r') as zip_file:
@@ -466,16 +515,28 @@ async def extract_and_process_zip(file_content: bytes, depth: int = 0) -> str:
                 if file_name.endswith('/') or file_name.startswith('.'):
                     continue
                 
+                # Check if this is a ZIP file
+                file_ext = get_file_extension(file_name)
+                if file_ext == 'zip':
+                    nested_zips_found.append(file_name)
+                    # Only process the first nested ZIP found
+                    if first_nested_zip_processed:
+                        logger.info(f"Skipping nested ZIP {file_name} - already processed first nested ZIP")
+                        all_extracted_text.append(f"=== FILE: {file_name} ===\nSkipped: Multiple nested ZIPs found, only processing first one\n")
+                        continue
+                
                 # Check file size before extraction
                 file_info = zip_file.getinfo(file_name)
                 if file_info.file_size > MAX_FILE_SIZE:
                     logger.warning(f"Skipping {file_name}: file too large ({file_info.file_size} bytes)")
+                    all_extracted_text.append(f"=== FILE: {file_name} ===\nSkipped: File too large ({file_info.file_size} bytes)\n")
                     continue
                 
                 # Check if format is supported
                 is_supported, error_msg = is_supported_format(file_name)
                 if not is_supported:
                     logger.info(f"Skipping {file_name}: {error_msg}")
+                    all_extracted_text.append(f"=== FILE: {file_name} ===\nSkipped: {error_msg}\n")
                     continue
                 
                 try:
@@ -483,17 +544,24 @@ async def extract_and_process_zip(file_content: bytes, depth: int = 0) -> str:
                     extracted_content = zip_file.read(file_name)
                     logger.info(f"Processing extracted file: {file_name} (depth: {depth + 1})")
                     
+                    # Special handling for nested ZIPs
+                    if file_ext == 'zip':
+                        if depth >= MAX_ZIP_DEPTH - 1:  # At maximum depth
+                            logger.warning(f"Cannot process nested ZIP {file_name} - at maximum depth {depth + 1}")
+                            all_extracted_text.append(f"=== FILE: {file_name} ===\nSkipped: ZIP nesting limit reached (max 1 level allowed)\n")
+                            continue
+                        else:
+                            first_nested_zip_processed = True
+                            logger.info(f"Processing first nested ZIP: {file_name}")
+                    
                     # Process based on file type, passing depth for nested ZIPs
                     file_text = await process_file_content(extracted_content, file_name, depth)
                     
                     if file_text and file_text.strip():
-                        # Check if it's the depth limit warning for nested ZIP
-                        if "ZIP nesting too deep" in file_text:
-                            logger.warning(f"Skipping nested ZIP {file_name} - depth limit reached")
-                            all_extracted_text.append(f"=== FILE: {file_name} ===\nSkipped: {file_text}\n")
-                        else:
-                            all_extracted_text.append(f"=== FILE: {file_name} ===\n{file_text}\n")
-                            processed_files.append(file_name)
+                        all_extracted_text.append(f"=== FILE: {file_name} ===\n{file_text}\n")
+                        processed_files.append(file_name)
+                    else:
+                        all_extracted_text.append(f"=== FILE: {file_name} ===\nNo content extracted\n")
                     
                     # Memory cleanup after each file
                     cleanup_variables(extracted_content)
@@ -504,11 +572,27 @@ async def extract_and_process_zip(file_content: bytes, depth: int = 0) -> str:
                     all_extracted_text.append(f"=== FILE: {file_name} ===\nError processing file: {str(e)}\n")
         
         final_text = "\n".join(all_extracted_text)
-        logger.info(f"📦 ZIP processing completed (depth {depth + 1}) in {time.time() - start_time:.2f}s. Processed {len(processed_files)} files")
         
-        # Log if we reached depth limits
-        if depth == MAX_ZIP_DEPTH - 1:
-            logger.info(f"⚠️  Maximum ZIP nesting depth ({MAX_ZIP_DEPTH}) reached. No deeper extraction allowed.")
+        # Add summary information
+        summary_info = []
+        summary_info.append(f"=== ZIP PROCESSING SUMMARY ===")
+        summary_info.append(f"Total files found: {len(file_list)}")
+        summary_info.append(f"Successfully processed: {len(processed_files)}")
+        
+        if nested_zips_found:
+            summary_info.append(f"Nested ZIPs found: {len(nested_zips_found)} ({', '.join(nested_zips_found[:5])}{' ...' if len(nested_zips_found) > 5 else ''})")
+            if len(nested_zips_found) > 1:
+                summary_info.append(f"Only processed first nested ZIP: {nested_zips_found[0]}")
+                summary_info.append(f"Skipped nested ZIPs: {', '.join(nested_zips_found[1:])}")
+        
+        summary_info.append(f"Processing depth: {depth + 1}/{MAX_ZIP_DEPTH + 1}")
+        summary_info.append(f"="*50)
+        
+        final_text = "\n".join(summary_info) + "\n\n" + final_text
+        
+        logger.info(f"📦 ZIP processing completed (depth {depth + 1}) in {time.time() - start_time:.2f}s. Processed {len(processed_files)} files")
+        if nested_zips_found:
+            logger.info(f"📦 Found {len(nested_zips_found)} nested ZIP(s), processed only first: {nested_zips_found[0] if nested_zips_found else 'none'}")
         
         return final_text if final_text.strip() else "No processable content found in ZIP file"
         
@@ -624,16 +708,52 @@ async def download_and_process_document(url: str) -> str:
 
 # ---- Enhanced Embeddings and Search ----
 
-async def get_embeddings(texts: List[str], input_type: str = "search_document") -> List[List[float]]:
-    start_time = time.time()
-    logger.info(f"Getting embeddings for {len(texts)} texts")
-    
+async def get_embeddings_batch(client: httpx.AsyncClient, batch: List[str], input_type: str, batch_num: int) -> List[List[float]]:
+    """Process a single batch of embeddings"""
     url = "https://api.cohere.com/v1/embed"
+    current_cohere_key = get_current_cohere_key()
     headers = {
-        "Authorization": f"Bearer {COHERE_API_KEY}",
+        "Authorization": f"Bearer {current_cohere_key}",
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
+    
+    data = {
+        "model": COHERE_MODEL,
+        "texts": batch,
+        "input_type": input_type,
+        "truncate": "END"
+    }
+    
+    try:
+        response = await client.post(url, headers=headers, json=data)
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            embeddings_data = response_data.get("embeddings", [])
+            
+            batch_embeddings = []
+            for embedding in embeddings_data:
+                vec = np.array(embedding, dtype=np.float32)
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec = vec / norm
+                batch_embeddings.append(vec.tolist())
+            
+            logger.info(f"Completed embedding batch {batch_num}")
+            return batch_embeddings
+        else:
+            logger.error(f"Cohere API error for batch {batch_num}: {response.status_code} - {response.text}")
+            response.raise_for_status()
+            
+    except Exception as e:
+        logger.error(f"Embedding batch {batch_num} failed: {str(e)}")
+        raise e
+
+async def get_embeddings(texts: List[str], input_type: str = "search_document") -> List[List[float]]:
+    start_time = time.time()
+    current_cohere_key = get_current_cohere_key()
+    logger.info(f"🔑 Using Cohere API KEY #{current_cohere_key_index + 1} for {len(texts)} texts with parallel processing")
     
     clean_texts = []
     for text in texts:
@@ -644,44 +764,35 @@ async def get_embeddings(texts: List[str], input_type: str = "search_document") 
     
     if not clean_texts:
         raise ValueError("No valid texts provided for embedding")
-    all_embeddings = []
     
+    # Create batches
+    batches = [clean_texts[i:i+EMBEDDING_BATCH_SIZE] for i in range(0, len(clean_texts), EMBEDDING_BATCH_SIZE)]
+    
+    # Process batches with limited concurrency to avoid overwhelming the API
     timeout = httpx.Timeout(45.0)
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
     
-    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-        for i in range(0, len(clean_texts), EMBEDDING_BATCH_SIZE):
-            batch = clean_texts[i:i+EMBEDDING_BATCH_SIZE]
-            
-            data = {
-                "model": COHERE_MODEL,
-                "texts": batch,
-                "input_type": input_type,
-                "truncate": "END"
-            }
-            
-            try:
-                response = await client.post(url, headers=headers, json=data)
-                
-                if response.status_code == 200:
-                    response_data = response.json()
-                    embeddings_data = response_data.get("embeddings", [])
-                    
-                    for embedding in embeddings_data:
-                        vec = np.array(embedding, dtype=np.float32)
-                        norm = np.linalg.norm(vec)
-                        if norm > 0:
-                            vec = vec / norm
-                        all_embeddings.append(vec.tolist())
-                else:
-                    logger.error(f"Cohere API error: {response.status_code} - {response.text}")
-                    response.raise_for_status()
-                    
-            except Exception as e:
-                logger.error(f"Embedding batch {i//EMBEDDING_BATCH_SIZE + 1} failed: {str(e)}")
-                raise e
+    all_embeddings = []
     
-    logger.info(f"Got {len(all_embeddings)} embeddings in {time.time() - start_time:.2f}s")
+    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+        # Process batches in groups to control concurrency
+        for i in range(0, len(batches), PARALLEL_EMBEDDING_CONCURRENT):
+            concurrent_batches = batches[i:i+PARALLEL_EMBEDDING_CONCURRENT]
+            
+            # Create tasks for concurrent batch processing
+            tasks = [
+                get_embeddings_batch(client, batch, input_type, i + j + 1)
+                for j, batch in enumerate(concurrent_batches)
+            ]
+            
+            # Wait for all batches in this group to complete
+            batch_results = await asyncio.gather(*tasks)
+            
+            # Collect results
+            for batch_embeddings in batch_results:
+                all_embeddings.extend(batch_embeddings)
+    
+    logger.info(f"Got {len(all_embeddings)} embeddings in {time.time() - start_time:.2f}s using parallel processing")
     return all_embeddings
 
 
@@ -727,33 +838,39 @@ def build_prompt(question: str, context_chunks: List[str]) -> str:
 """
     
     if is_yes_no:
-        response_instruction = """This is a yes/no question. Start your response with "Yes" or "No", then provide a brief explanation with specific details from the context in 25-40 words total."""
+        response_instruction = """This is a yes/no question. Start your response with "Yes" or "No", then provide a brief explanation with specific details in 25-40 words total."""
     else:
-        response_instruction = """Answer in ONE concise, direct paragraph (40-80 words maximum). Include specific numbers, amounts, percentages, and conditions from the context. Use figures (1, 2, 3) instead of words (one, two, three) for all numbers."""
+        response_instruction = """Answer in ONE concise, direct paragraph (40-80 words maximum). Include specific numbers, amounts, percentages, and conditions. Use figures (1, 2, 3) instead of words (one, two, three) for all numbers."""
 
-    return f"""You are an intelligent insurance analyst who understands policy documents and can reason about their content. Read the context carefully and provide thoughtful, accurate answers.
+    return f"""You are an intelligent insurance analyst who understands policy documents and can reason about their content. Follow this answer hierarchy:
+
+**ANSWER HIERARCHY (in order of priority):**
+1. **DIRECT ANSWER**: If the exact answer is clearly stated in the context, provide it directly with specific references
+2. **DEDUCED ANSWER**: If not directly stated, deduce the answer by connecting related information from the context
+3. **INTELLIGENT REASONING**: If neither direct nor deduction is possible, provide a well-reasoned answer based on general insurance knowledge and principles
 
 **YOUR TASK:** {response_instruction}
 
 **REASONING APPROACH:**
-1. Read and understand the context thoroughly
-2. Think about how the information relates to the question
-3. Consider the logical connections between different pieces of information
-4. Provide answers based on understanding, not just keyword matching
-5. Include specific numbers, dates, amounts, and conditions when relevant
-6. If information is partially available, explain what you can determine and what is missing
+1. First, search for DIRECT answers in the context - look for exact matches or explicit statements
+2. If no direct answer, DEDUCE by finding patterns, rules, and logical connections in the context data
+3. Look for mathematical patterns, sequences, or operations demonstrated in similar examples
+4. Only use general knowledge if absolutely no patterns can be deduced from the context
+5. Always be transparent about your reasoning: "According to the document...", "Following the pattern shown...", "Based on similar examples..."
+6. Include specific numbers, dates, amounts, and conditions when available
+7. PRIORITY: Pattern deduction from context over standard knowledge
 
 **CONTEXT TO ANALYZE:**
 {context}
 
 **QUESTION:** {question}
 
-**ANSWER (provide a thoughtful, reasoned response based on the context):**"""
+**ANSWER (follow the hierarchy - direct → deduced → intelligent reasoning):**"""
 
 async def ask_llm(prompt: str, retry_count: int = 0) -> str:
     try:
         current_api_key = get_current_gemini_key()
-        logger.info(f"🔑 Using Gemini API KEY_{GEMINI_API_KEYS.index(current_api_key) + 1} (Request #{request_count}/12)")
+        logger.info(f"🔑 Using Gemini API KEY_{GEMINI_API_KEYS.index(current_api_key) + 1} (Request #{gemini_request_count}/12)")
         
         start_time = time.time()
         
@@ -804,12 +921,16 @@ async def ask_llm(prompt: str, retry_count: int = 0) -> str:
 async def root():
     memory_info = get_memory_usage()
     return {
-        "message": "Enhanced Multi-Format Document Processor with Memory Optimization", 
-        "status": "memory_optimized_v2.1",
+        "message": "Intelligent Multi-Format Document Processor with Parallel Processing & Reasoning", 
+        "status": "intelligent_reasoning_v3.1",
         "supported_formats": list(SUPPORTED_FORMATS),
-        "api_keys_count": len(GEMINI_API_KEYS),
-        "current_key_index": current_key_index + 1,
-        "requests_on_current_key": request_count,
+        "api_keys": {
+            "gemini_keys_count": len(GEMINI_API_KEYS),
+            "current_gemini_key": current_gemini_key_index + 1,
+            "gemini_requests_on_current_key": gemini_request_count,
+            "cohere_keys_count": len(COHERE_API_KEYS),
+            "current_cohere_key": current_cohere_key_index + 1
+        },
         "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024),
         "current_memory_usage_mb": memory_info.get('process_memory_mb', 0),
         "memory_optimization": "render_free_tier_ready",
@@ -901,17 +1022,68 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
                 
                 if not search_results:
                     logger.warning(f"No search results found for question: {question}")
-                    answer = "The information is not available in the provided context."
+                    # Use intelligent reasoning even without search results
+                    fallback_prompt = f"""You are an intelligent analyst. No specific context was found, but try to reason logically about the question.
+
+**QUESTION:** {question}
+
+**INSTRUCTIONS:**
+- Look for mathematical patterns, logical sequences, or domain-specific rules
+- If it's a mathematical question, try to find underlying logic or patterns
+- Only use general knowledge if no logical patterns can be determined
+- Be transparent about your reasoning approach
+- Keep answer concise (40-80 words)
+- Use figures (1, 2, 3) instead of words for numbers
+
+**ANSWER (logical reasoning or general knowledge):**"""
+                    
+                    try:
+                        answer = await ask_llm(fallback_prompt)
+                        if answer and not answer.startswith("Unable to generate"):
+                            # Prefix to indicate this is based on general knowledge
+                            answer = f"Based on general insurance principles: {answer}"
+                        else:
+                            answer = "I'd need more specific policy information to provide a definitive answer for this question."
+                    except Exception as e:
+                        logger.error(f"Fallback answer generation failed: {str(e)}")
+                        answer = "I'd need more specific policy information to provide a definitive answer for this question."
+                    
                     answers.append(answer)
                     qa_storage.append([question, answer])
                     continue
                 
-                # Enhance and format results
-                relevant_chunks = faiss_service.enhance_results(search_results, question)
+                # Check if search results have good relevance scores
+                best_score = search_results[0].get('final_score', 0) if hasattr(search_results[0], 'get') and 'final_score' in search_results[0] else search_results[0].get('similarity_score', 0)
                 
-                # Build prompt and get answer
-                prompt = build_prompt(question, relevant_chunks)
-                response = await ask_llm(prompt)
+                if best_score < 0.15:  # Low relevance threshold
+                    logger.info(f"Low relevance score ({best_score:.3f}) for question: {question[:50]}... Using hybrid approach")
+                    
+                    # Combine context with intelligent reasoning
+                    relevant_chunks = faiss_service.enhance_results(search_results[:5], question)  # Use fewer chunks
+                    limited_context = "\n\n---\n\n".join(relevant_chunks[:5])
+                    
+                    hybrid_prompt = f"""You are an intelligent data analyst. The available context has limited relevance, but analyze it carefully for patterns, rules, or examples.
+
+**APPROACH:**
+1. Look for ANY patterns, sequences, or mathematical operations in the context
+2. Find similar examples and deduce the underlying rule or logic
+3. Apply the discovered pattern to answer the question
+4. If no patterns exist, then provide reasoning based on the domain
+5. Be transparent: "Following the pattern...", "Based on similar examples...", "The data shows..."
+
+**CONTEXT TO ANALYZE FOR PATTERNS:**
+{limited_context}
+
+**QUESTION:** {question}
+
+**ANSWER (look for patterns first, then reasoning):**"""
+                    
+                    response = await ask_llm(hybrid_prompt)
+                else:
+                    # Good relevance - use normal approach
+                    relevant_chunks = faiss_service.enhance_results(search_results, question)
+                    prompt = build_prompt(question, relevant_chunks)
+                    response = await ask_llm(prompt)
                 
                 # Clean response
                 response = response.strip()
@@ -958,6 +1130,9 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
         # Final comprehensive memory cleanup
         clear_memory("Complete request cleanup")
         
+        # Rotate Cohere API key for the next request
+        rotate_cohere_key()
+        
         return QueryResponse(answers=answers)
         
     except HTTPException as he:
@@ -977,9 +1152,11 @@ async def health_check():
         "version": "enhanced_memory_optimized_v2.1",
         "supported_formats": list(SUPPORTED_FORMATS),
         "unsupported_formats": list(UNSUPPORTED_FORMATS),
-        "api_keys_available": len(GEMINI_API_KEYS),
-        "current_key": current_key_index + 1,
-        "requests_on_current_key": request_count,
+        "gemini_keys_available": len(GEMINI_API_KEYS),
+        "current_gemini_key": current_gemini_key_index + 1,
+        "gemini_requests_on_current_key": gemini_request_count,
+        "cohere_keys_available": len(COHERE_API_KEYS),
+        "current_cohere_key": current_cohere_key_index + 1,
         "qa_storage_size": len(qa_storage),
         "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024),
         "faiss_index": faiss_stats,
@@ -988,7 +1165,19 @@ async def health_check():
             "topic_based_chunking": True,
             "hybrid_search": True,
             "faiss_indexing": True,
-            "quality_scoring": True
+            "quality_scoring": True,
+            "parallel_chunking": True,
+            "parallel_embedding": True,
+            "parallel_ocr": True,
+            "intelligent_reasoning": True,
+            "context_deduction": True,
+            "fallback_intelligence": True
+        },
+        "parallel_processing": {
+            "max_workers": MAX_WORKERS,
+            "parallel_chunk_size": PARALLEL_CHUNK_SIZE,
+            "parallel_ocr_batch": PARALLEL_OCR_BATCH,
+            "parallel_embedding_concurrent": PARALLEL_EMBEDDING_CONCURRENT
         }
     }
 

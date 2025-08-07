@@ -7,12 +7,14 @@ load_dotenv()
 
 # API Keys
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+COHERE_API_KEY_2 = os.getenv("COHERE_API_KEY_2")
 GEMINI_API_KEY_1 = os.getenv("GEMINI_API_KEY_1")
 GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2")
 GEMINI_API_KEY_3 = os.getenv("GEMINI_API_KEY_3")
 OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
 
 # API Key Management
+COHERE_API_KEYS = [key for key in [COHERE_API_KEY, COHERE_API_KEY_2] if key is not None]
 GEMINI_API_KEYS = [key for key in [GEMINI_API_KEY_1, GEMINI_API_KEY_2, GEMINI_API_KEY_3] if key is not None]
 REQUESTS_PER_KEY = 12
 
@@ -58,15 +60,21 @@ SEMANTIC_SIMILARITY_THRESHOLD = 0.20  # Reasonable threshold for quality
 
 # LLM Settings
 GEMINI_MODEL = "gemini-2.5-flash-lite"
-LLM_TEMPERATURE = 0.15  # Slightly higher for better reasoning
-LLM_MAX_TOKENS = 250  # Increased for more detailed responses
+LLM_TEMPERATURE = 0.25  # Higher for better reasoning and creativity
+LLM_MAX_TOKENS = 300  # Increased for more detailed intelligent responses
 LLM_TOP_P = 0.9
-LLM_TOP_K = 25
+LLM_TOP_K = 30
 
 # Embedding Settings
 COHERE_MODEL = "embed-english-v3.0"
 EMBEDDING_BATCH_SIZE = 96
 EMBEDDING_MAX_LENGTH = 2000
+
+# Parallel Processing Settings
+MAX_WORKERS = min(4, os.cpu_count())  # Conservative worker count for memory management
+PARALLEL_CHUNK_SIZE = 5  # Number of chunks to process in parallel
+PARALLEL_OCR_BATCH = 3  # Number of images to process simultaneously
+PARALLEL_EMBEDDING_CONCURRENT = 2  # Number of concurrent embedding requests
 
 # Optional Large Document Mode (can be enabled via environment variable)
 # Set LARGE_DOC_MODE=true in environment to enable
@@ -84,5 +92,5 @@ if LARGE_DOC_MODE:
     print("🔍 LARGE DOCUMENT MODE ENABLED - Using enhanced settings for large documents")
 
 # Validation
-if not COHERE_API_KEY or not GEMINI_API_KEYS:
+if not COHERE_API_KEYS or not GEMINI_API_KEYS:
     raise ValueError("Missing required API keys. Check COHERE_API_KEY and GEMINI_API_KEY environment variables.")

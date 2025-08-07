@@ -9,6 +9,8 @@ import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
 import spacy
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Download required NLTK data with comprehensive fallback
 def ensure_nltk_data():
@@ -43,7 +45,8 @@ except OSError:
 
 from app.config.settings import (
     CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE,
-    SENTENCE_MIN_LENGTH, PARAGRAPH_MIN_LENGTH, SEMANTIC_THRESHOLD
+    SENTENCE_MIN_LENGTH, PARAGRAPH_MIN_LENGTH, SEMANTIC_THRESHOLD,
+    MAX_WORKERS, PARALLEL_CHUNK_SIZE
 )
 
 logger = logging.getLogger(__name__)
@@ -347,6 +350,40 @@ class EnhancedChunker:
         
         return chunks
     
+    def create_chunks_parallel(self, text_segments: List[str], chunk_method: str) -> List[Dict]:
+        """Create chunks using parallel processing for different text segments"""
+        if len(text_segments) <= 1:
+            # Not worth parallelizing for small inputs
+            if text_segments:
+                return getattr(self, f'create_{chunk_method}_chunks')(text_segments[0])
+            return []
+        
+        all_chunks = []
+        max_workers = min(MAX_WORKERS, len(text_segments))
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit chunking tasks for each text segment
+            future_to_segment = {
+                executor.submit(getattr(self, f'create_{chunk_method}_chunks'), segment): i
+                for i, segment in enumerate(text_segments)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_segment):
+                segment_idx = future_to_segment[future]
+                try:
+                    chunks = future.result()
+                    if chunks:
+                        # Add segment information to chunks
+                        for chunk in chunks:
+                            chunk['segment_idx'] = segment_idx
+                        all_chunks.extend(chunks)
+                        logger.info(f"Completed parallel chunking for segment {segment_idx + 1}")
+                except Exception as e:
+                    logger.error(f"Parallel chunking failed for segment {segment_idx}: {str(e)}")
+        
+        return all_chunks
+    
     def merge_and_rank_chunks(self, chunk_sets: List[List[Dict]]) -> List[Dict]:
         """Merge chunks from different strategies and rank by quality"""
         all_chunks = []
@@ -447,9 +484,9 @@ class EnhancedChunker:
         return score
 
 def get_enhanced_chunks(text: str) -> List[Dict]:
-    """Main function to get enhanced chunks using multiple strategies"""
+    """Main function to get enhanced chunks using multiple strategies with parallel processing"""
     start_time = time.time()
-    logger.info("Starting enhanced chunking with multiple strategies")
+    logger.info("Starting enhanced chunking with parallel processing")
     
     chunker = EnhancedChunker()
     
@@ -460,29 +497,60 @@ def get_enhanced_chunks(text: str) -> List[Dict]:
         logger.warning("Text too short for meaningful chunking")
         return [{'text': text, 'type': 'single', 'quality_score': 0.5}]
     
-    # Apply multiple chunking strategies
+    # Split text into segments for parallel processing if it's large enough
+    text_segments = []
+    if len(text) > MAX_CHUNK_SIZE * 10:  # Only parallelize for large texts
+        # Split by double newlines (paragraphs) or sections
+        segments = re.split(r'\n\s*\n|===|---', text)
+        segments = [seg.strip() for seg in segments if len(seg.strip()) > MIN_CHUNK_SIZE]
+        
+        if len(segments) > 1:
+            text_segments = segments
+            logger.info(f"Split large text into {len(text_segments)} segments for parallel processing")
+    
+    # If no segments or text is not large enough, use single text
+    if not text_segments:
+        text_segments = [text]
+    
+    # Apply multiple chunking strategies with optional parallelization
     chunk_sets = []
     
-    # 1. Sliding window chunks (baseline)
-    sliding_chunks = chunker.create_sliding_window_chunks(text)
+    # 1. Sliding window chunks (baseline) - with parallel processing for large texts
+    if len(text_segments) > 1:
+        sliding_chunks = chunker.create_chunks_parallel(text_segments, 'sliding_window')
+    else:
+        sliding_chunks = chunker.create_sliding_window_chunks(text)
+    
     if sliding_chunks:
         chunk_sets.append(sliding_chunks)
         logger.info(f"Created {len(sliding_chunks)} sliding window chunks")
     
-    # 2. Semantic chunks
-    semantic_chunks = chunker.create_semantic_chunks(text)
+    # 2. Semantic chunks - with parallel processing for large texts
+    if len(text_segments) > 1:
+        semantic_chunks = chunker.create_chunks_parallel(text_segments, 'semantic')
+    else:
+        semantic_chunks = chunker.create_semantic_chunks(text)
+    
     if semantic_chunks:
         chunk_sets.append(semantic_chunks)
         logger.info(f"Created {len(semantic_chunks)} semantic chunks")
     
-    # 3. Topic-based chunks
-    topic_chunks = chunker.create_topic_based_chunks(text)
+    # 3. Topic-based chunks - with parallel processing for large texts
+    if len(text_segments) > 1:
+        topic_chunks = chunker.create_chunks_parallel(text_segments, 'topic_based')
+    else:
+        topic_chunks = chunker.create_topic_based_chunks(text)
+    
     if topic_chunks:
         chunk_sets.append(topic_chunks)
         logger.info(f"Created {len(topic_chunks)} topic-based chunks")
     
-    # 4. Structured chunks
-    structured_chunks = chunker.create_structured_chunks(text)
+    # 4. Structured chunks - with parallel processing for large texts
+    if len(text_segments) > 1:
+        structured_chunks = chunker.create_chunks_parallel(text_segments, 'structured')
+    else:
+        structured_chunks = chunker.create_structured_chunks(text)
+    
     if structured_chunks:
         chunk_sets.append(structured_chunks)
         logger.info(f"Created {len(structured_chunks)} structured chunks")
@@ -494,7 +562,7 @@ def get_enhanced_chunks(text: str) -> List[Dict]:
         # Fallback to simple chunking
         final_chunks = chunker.create_sliding_window_chunks(text)
     
-    logger.info(f"Enhanced chunking completed in {time.time() - start_time:.2f}s. "
+    logger.info(f"Enhanced chunking with parallel processing completed in {time.time() - start_time:.2f}s. "
                 f"Created {len(final_chunks)} high-quality chunks")
     
     return final_chunks
