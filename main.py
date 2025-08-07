@@ -442,9 +442,15 @@ def process_image_ocr(image_content: bytes, filename: str = "") -> str:
         return f"OCR processing failed for {filename}"
 
 # ---- ZIP File Handler ----
-async def extract_and_process_zip(file_content: bytes) -> str:
-    """Extract and process ZIP files recursively"""
-    logger.info("Starting ZIP file processing")
+async def extract_and_process_zip(file_content: bytes, depth: int = 0) -> str:
+    """Extract and process ZIP files with limited recursion depth"""
+    MAX_ZIP_DEPTH = 2  # Maximum nesting depth for ZIP files
+    
+    if depth >= MAX_ZIP_DEPTH:
+        logger.warning(f"ZIP nesting depth limit reached ({MAX_ZIP_DEPTH}). Skipping further extraction.")
+        return "No meaningful content found - ZIP nesting too deep (max 2 levels allowed)"
+    
+    logger.info(f"Starting ZIP file processing (depth level: {depth + 1})")
     start_time = time.time()
     
     all_extracted_text = []
@@ -475,25 +481,34 @@ async def extract_and_process_zip(file_content: bytes) -> str:
                 try:
                     # Extract file content
                     extracted_content = zip_file.read(file_name)
-                    logger.info(f"Processing extracted file: {file_name}")
+                    logger.info(f"Processing extracted file: {file_name} (depth: {depth + 1})")
                     
-                    # Process based on file type
-                    file_text = await process_file_content(extracted_content, file_name)
+                    # Process based on file type, passing depth for nested ZIPs
+                    file_text = await process_file_content(extracted_content, file_name, depth)
                     
                     if file_text and file_text.strip():
-                        all_extracted_text.append(f"=== FILE: {file_name} ===\n{file_text}\n")
-                        processed_files.append(file_name)
+                        # Check if it's the depth limit warning for nested ZIP
+                        if "ZIP nesting too deep" in file_text:
+                            logger.warning(f"Skipping nested ZIP {file_name} - depth limit reached")
+                            all_extracted_text.append(f"=== FILE: {file_name} ===\nSkipped: {file_text}\n")
+                        else:
+                            all_extracted_text.append(f"=== FILE: {file_name} ===\n{file_text}\n")
+                            processed_files.append(file_name)
                     
                     # Memory cleanup after each file
-                    del extracted_content
-                    clear_memory()
+                    cleanup_variables(extracted_content)
+                    clear_memory(f"ZIP file {file_name} processing")
                     
                 except Exception as e:
                     logger.error(f"Error processing {file_name} from ZIP: {str(e)}")
                     all_extracted_text.append(f"=== FILE: {file_name} ===\nError processing file: {str(e)}\n")
         
         final_text = "\n".join(all_extracted_text)
-        logger.info(f"ZIP processing completed in {time.time() - start_time:.2f}s. Processed {len(processed_files)} files")
+        logger.info(f"📦 ZIP processing completed (depth {depth + 1}) in {time.time() - start_time:.2f}s. Processed {len(processed_files)} files")
+        
+        # Log if we reached depth limits
+        if depth == MAX_ZIP_DEPTH - 1:
+            logger.info(f"⚠️  Maximum ZIP nesting depth ({MAX_ZIP_DEPTH}) reached. No deeper extraction allowed.")
         
         return final_text if final_text.strip() else "No processable content found in ZIP file"
         
@@ -502,8 +517,8 @@ async def extract_and_process_zip(file_content: bytes) -> str:
         raise Exception(f"ZIP processing failed: {str(e)}")
 
 # ---- Unified File Content Processor ----
-async def process_file_content(file_content: bytes, filename: str) -> str:
-    """Process file content based on file type"""
+async def process_file_content(file_content: bytes, filename: str, depth: int = 0) -> str:
+    """Process file content based on file type with depth tracking for nested ZIPs"""
     ext = get_file_extension(filename)
     
     try:
@@ -549,7 +564,7 @@ async def process_file_content(file_content: bytes, filename: str) -> str:
             return words_to_numbers(text_content.strip())
             
         elif ext == 'zip':
-            return await extract_and_process_zip(file_content)
+            return await extract_and_process_zip(file_content, depth + 1)
             
         else:
             raise Exception(f"Unsupported file format: {ext}")
