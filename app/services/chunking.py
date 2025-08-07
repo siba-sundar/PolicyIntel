@@ -10,16 +10,29 @@ from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
 import spacy
 
-# Download required NLTK data
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+# Download required NLTK data with comprehensive fallback
+def ensure_nltk_data():
+    """Ensure all required NLTK data is available"""
+    required_data = [
+        ('tokenizers/punkt', 'punkt'),
+        ('tokenizers/punkt_tab', 'punkt_tab'),
+        ('corpora/stopwords', 'stopwords'),
+        ('taggers/averaged_perceptron_tagger', 'averaged_perceptron_tagger')
+    ]
+    
+    for data_path, download_name in required_data:
+        try:
+            nltk.data.find(data_path)
+        except LookupError:
+            try:
+                print(f"Downloading NLTK data: {download_name}")
+                nltk.download(download_name, quiet=True)
+            except Exception as e:
+                print(f"Failed to download {download_name}: {e}")
+                # Continue anyway, we'll handle it in the code
 
-try:
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('stopwords')
+# Ensure NLTK data is available
+ensure_nltk_data()
 
 # Load spaCy model for advanced NLP
 try:
@@ -39,7 +52,20 @@ class EnhancedChunker:
     """Enhanced chunking service for precise Q&A with multiple strategies"""
     
     def __init__(self):
-        self.stop_words = set(stopwords.words('english')) if stopwords else set()
+        try:
+            self.stop_words = set(stopwords.words('english'))
+        except Exception as e:
+            logger.warning(f"Failed to load NLTK stopwords: {e}. Using basic fallback.")
+            # Basic English stopwords fallback
+            self.stop_words = set([
+                'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
+                'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'that', 'the',
+                'to', 'was', 'were', 'will', 'with', 'the', 'this', 'but', 'they',
+                'have', 'had', 'what', 'said', 'each', 'which', 'she', 'do',
+                'how', 'their', 'if', 'will', 'up', 'other', 'about', 'out',
+                'many', 'then', 'them', 'these', 'so', 'some', 'her', 'would',
+                'make', 'like', 'into', 'him', 'time', 'has', 'two', 'more'
+            ])
         self.tfidf_vectorizer = TfidfVectorizer(
             max_features=1000,
             stop_words='english',
@@ -84,8 +110,14 @@ class EnhancedChunker:
                         'end_char': sent.end_char
                     })
         else:
-            # Fallback to NLTK
-            sentences = sent_tokenize(text)
+            # Fallback to NLTK with error handling
+            try:
+                sentences = sent_tokenize(text)
+            except Exception as e:
+                logger.warning(f"NLTK sentence tokenization failed: {e}. Using simple fallback.")
+                # Simple fallback: split on sentence endings
+                sentences = re.split(r'[.!?]+\s+', text)
+            
             char_pos = 0
             
             for sent in sentences:
@@ -205,7 +237,11 @@ class EnhancedChunker:
     
     def create_topic_based_chunks(self, text: str) -> List[Dict]:
         """Create chunks based on topic changes using TF-IDF similarity"""
-        sentences = sent_tokenize(text)
+        try:
+            sentences = sent_tokenize(text)
+        except Exception as e:
+            logger.warning(f"NLTK sentence tokenization failed in topic chunking: {e}. Using simple fallback.")
+            sentences = re.split(r'[.!?]+\s+', text)
         
         if len(sentences) < 5:
             return []
@@ -372,14 +408,23 @@ class EnhancedChunker:
             score += length_score * 0.3
         
         # Sentence completeness score
-        sentences = sent_tokenize(text)
+        try:
+            sentences = sent_tokenize(text)
+        except Exception:
+            sentences = re.split(r'[.!?]+\s+', text)
+        
         complete_sentences = sum(1 for s in sentences if s.strip().endswith(('.', '!', '?')))
         if sentences:
             completeness_score = complete_sentences / len(sentences)
             score += completeness_score * 0.2
         
         # Information density score
-        words = word_tokenize(text.lower())
+        try:
+            words = word_tokenize(text.lower())
+        except Exception:
+            # Simple fallback word tokenization
+            words = re.findall(r'\b\w+\b', text.lower())
+        
         unique_words = set(words) - self.stop_words
         if words:
             density_score = len(unique_words) / len(words)
