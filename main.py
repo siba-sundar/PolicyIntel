@@ -32,6 +32,15 @@ import pytesseract
 import docx
 from docx import Document
 import requests
+from langdetect import detect
+
+
+
+from bs4 import BeautifulSoup
+import html2text
+from urllib.parse import urljoin, urlparse
+import re
+from typing import Dict, Any
 
 from app.services.chunking import get_enhanced_chunks
 from app.services.faiss_search import FAISSSearchService
@@ -52,6 +61,10 @@ logger = logging.getLogger(__name__)
 current_gemini_key_index = 0
 gemini_request_count = 0
 current_cohere_key_index = 0
+
+
+SUPPORTED_FORMATS.add('html')
+SUPPORTED_FORMATS.add('htm')
 
 # ---- Global array to store Q&A pairs ----
 qa_storage = []
@@ -190,6 +203,244 @@ def words_to_numbers(text):
         text = re.sub(r'\b' + word + r'\b', num, text, flags=re.IGNORECASE)
     
     return text
+
+
+def extract_html_content(html_content: str, base_url: str = "") -> Dict[str, Any]:
+    """
+    Extract meaningful content from HTML page
+    Returns structured data with different content types
+    """
+    logger.info("Starting HTML content extraction")
+    start_time = time.time()
+    
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Remove unwanted elements
+        for element in soup(['script', 'style', 'nav', 'header', 'footer', 
+                           'aside', 'advertisement', 'ads', 'sidebar']):
+            element.decompose()
+        
+        extracted_data = {
+            'title': '',
+            'main_content': '',
+            'metadata': {},
+            'structured_data': {},
+            'links': [],
+            'images': [],
+            'tables': [],
+            'lists': [],
+            'clean_text': ''
+        }
+        
+        # Extract title
+        title_tag = soup.find('title')
+        if title_tag:
+            extracted_data['title'] = title_tag.get_text().strip()
+        
+        # Extract metadata
+        meta_tags = soup.find_all('meta')
+        for meta in meta_tags:
+            name = meta.get('name') or meta.get('property') or meta.get('http-equiv')
+            content = meta.get('content')
+            if name and content:
+                extracted_data['metadata'][name] = content
+        
+        # Extract main content - prioritize semantic HTML5 elements
+        main_content_selectors = [
+            'main', 
+            'article', 
+            '[role="main"]',
+            '.content',
+            '.main-content',
+            '#content',
+            '#main'
+        ]
+        
+        main_content = None
+        for selector in main_content_selectors:
+            main_content = soup.select_one(selector)
+            if main_content:
+                break
+        
+        # If no semantic main content found, use body
+        if not main_content:
+            main_content = soup.find('body') or soup
+        
+        # Extract different content types
+        
+        # 1. Tables with structure preservation
+        tables = main_content.find_all('table')
+        for i, table in enumerate(tables):
+            table_data = []
+            headers = []
+            
+            # Extract headers
+            header_row = table.find('tr')
+            if header_row:
+                headers = [th.get_text().strip() for th in header_row.find_all(['th', 'td'])]
+            
+            # Extract rows
+            rows = table.find_all('tr')[1:] if headers else table.find_all('tr')
+            for row in rows:
+                cells = [td.get_text().strip() for td in row.find_all(['td', 'th'])]
+                if cells:
+                    table_data.append(cells)
+            
+            if table_data:
+                table_info = {
+                    'headers': headers,
+                    'rows': table_data,
+                    'table_number': i + 1
+                }
+                extracted_data['tables'].append(table_info)
+        
+        # 2. Lists (ordered and unordered)
+        lists = main_content.find_all(['ul', 'ol'])
+        for i, list_elem in enumerate(lists):
+            list_items = [li.get_text().strip() for li in list_elem.find_all('li')]
+            if list_items:
+                list_info = {
+                    'type': list_elem.name,
+                    'items': list_items,
+                    'list_number': i + 1
+                }
+                extracted_data['lists'].append(list_info)
+        
+        # 3. Links with context
+        links = main_content.find_all('a', href=True)
+        for link in links:
+            href = link.get('href')
+            text = link.get_text().strip()
+            if href and text:
+                # Resolve relative URLs
+                if base_url:
+                    href = urljoin(base_url, href)
+                extracted_data['links'].append({
+                    'url': href,
+                    'text': text
+                })
+        
+        # 4. Images with alt text
+        images = main_content.find_all('img')
+        for img in images:
+            src = img.get('src')
+            alt = img.get('alt', '')
+            if src:
+                if base_url:
+                    src = urljoin(base_url, src)
+                extracted_data['images'].append({
+                    'src': src,
+                    'alt': alt
+                })
+        
+        # 5. Structured data (JSON-LD, microdata)
+        json_ld_scripts = soup.find_all('script', type='application/ld+json')
+        for script in json_ld_scripts:
+            try:
+                structured_data = json.loads(script.string)
+                extracted_data['structured_data']['json_ld'] = structured_data
+            except:
+                pass
+        
+        # 6. Clean text extraction using html2text for better formatting
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        h.body_width = 0  # Don't wrap lines
+        
+        # Convert main content to clean text
+        main_content_html = str(main_content)
+        clean_text = h.handle(main_content_html)
+        
+        # Additional cleaning
+        clean_text = re.sub(r'\n\s*\n\s*\n', '\n\n', clean_text)  # Remove excessive newlines
+        clean_text = re.sub(r'[ \t]+', ' ', clean_text)  # Normalize spaces
+        clean_text = clean_text.strip()
+        
+        extracted_data['clean_text'] = clean_text
+        extracted_data['main_content'] = clean_text
+        
+        logger.info(f"HTML content extraction completed in {time.time() - start_time:.2f}s")
+        logger.info(f"Extracted: {len(clean_text)} characters, {len(tables)} tables, {len(lists)} lists, {len(links)} links")
+        
+        return extracted_data
+        
+    except Exception as e:
+        logger.error(f"HTML content extraction failed: {str(e)}")
+        raise Exception(f"HTML content extraction failed: {str(e)}")
+
+def format_html_content_for_processing(extracted_data: Dict[str, Any]) -> str:
+    """
+    Format extracted HTML data into a structured text format for document processing
+    """
+    formatted_parts = []
+    
+    # Add title
+    if extracted_data.get('title'):
+        formatted_parts.append(f"=== PAGE TITLE ===\n{extracted_data['title']}\n")
+    
+    # Add metadata if relevant
+    metadata = extracted_data.get('metadata', {})
+    relevant_meta = {}
+    for key, value in metadata.items():
+        if key.lower() in ['description', 'keywords', 'author', 'subject']:
+            relevant_meta[key] = value
+    
+    if relevant_meta:
+        formatted_parts.append("=== PAGE METADATA ===")
+        for key, value in relevant_meta.items():
+            formatted_parts.append(f"{key}: {value}")
+        formatted_parts.append("")
+    
+    # Add structured data if available
+    if extracted_data.get('structured_data'):
+        formatted_parts.append("=== STRUCTURED DATA ===")
+        structured_data = extracted_data['structured_data']
+        formatted_parts.append(json.dumps(structured_data, indent=2))
+        formatted_parts.append("")
+    
+    # Add tables with proper formatting
+    tables = extracted_data.get('tables', [])
+    for table in tables:
+        formatted_parts.append(f"=== TABLE {table['table_number']} ===")
+        
+        if table['headers']:
+            formatted_parts.append("HEADERS: " + " | ".join(table['headers']))
+            formatted_parts.append("-" * 50)
+        
+        for row in table['rows']:
+            formatted_parts.append(" | ".join(row))
+        
+        formatted_parts.append("")
+    
+    # Add lists
+    lists = extracted_data.get('lists', [])
+    for list_info in lists:
+        formatted_parts.append(f"=== {list_info['type'].upper()} LIST {list_info['list_number']} ===")
+        for i, item in enumerate(list_info['items'], 1):
+            if list_info['type'] == 'ol':
+                formatted_parts.append(f"{i}. {item}")
+            else:
+                formatted_parts.append(f"• {item}")
+        formatted_parts.append("")
+    
+    # Add main content
+    if extracted_data.get('main_content'):
+        formatted_parts.append("=== MAIN CONTENT ===")
+        formatted_parts.append(extracted_data['main_content'])
+        formatted_parts.append("")
+    
+    # Add important links if they contain useful context
+    links = extracted_data.get('links', [])
+    important_links = [link for link in links if len(link['text']) > 10][:10]  # Limit to 10 most substantial links
+    if important_links:
+        formatted_parts.append("=== IMPORTANT LINKS ===")
+        for link in important_links:
+            formatted_parts.append(f"{link['text']}: {link['url']}")
+        formatted_parts.append("")
+    
+    return "\n".join(formatted_parts)
 
 # ---- Excel Parser with Proper Header-Value Association ----
 def parse_excel_with_headers(file_content: bytes) -> str:
@@ -649,7 +900,23 @@ async def process_file_content(file_content: bytes, filename: str, depth: int = 
             
         elif ext == 'zip':
             return await extract_and_process_zip(file_content, depth + 1)
+        
+        
+        elif ext in ['html', 'htm'] or 'html' in filename.lower():
+            # Handle HTML files
+            try:
+                html_content = file_content.decode('utf-8')
+            except UnicodeDecodeError:
+                try:
+                    html_content = file_content.decode('latin-1')
+                except UnicodeDecodeError:
+                    html_content = file_content.decode('utf-8', errors='ignore')
             
+            # Extract and format HTML content
+            extracted_data = extract_html_content(html_content)
+            formatted_text = format_html_content_for_processing(extracted_data)
+            return words_to_numbers(formatted_text.strip())
+                
         else:
             raise Exception(f"Unsupported file format: {ext}")
             
@@ -661,27 +928,25 @@ async def process_file_content(file_content: bytes, filename: str, depth: int = 
 async def download_and_process_document(url: str) -> str:
     """Download and process document from URL"""
     start_time = time.time()
-    logger.info(f"Starting document download from: {url}")
+    logger.info(f"Starting enhanced document download from: {url}")
     
     try:
-        # Determine expected file type from URL
-        filename = url.split('/')[-1].split('?')[0]  # Remove query parameters
-        if not filename or '.' not in filename:
-            filename = "document.pdf"  # Default assumption
-        
-        # Check if format is supported
-        is_supported, error_msg = is_supported_format(filename)
-        if not is_supported:
-            raise HTTPException(status_code=400, detail=error_msg)
-        
         # Download with optimized settings
         timeout = httpx.Timeout(30.0, connect=5.0)
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
         
-        async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True) as client:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True, headers=headers) as client:
             response = await client.get(url)
         
         response.raise_for_status()
+        
+        # Check content type
+        content_type = response.headers.get('content-type', '').lower()
+        logger.info(f"Content type: {content_type}")
         
         # Check file size
         content_length = len(response.content)
@@ -690,8 +955,51 @@ async def download_and_process_document(url: str) -> str:
         
         logger.info(f"Document downloaded successfully. Size: {content_length} bytes")
         
-        # Process based on file type
-        document_text = await process_file_content(response.content, filename)
+        # Determine processing method based on content type or URL
+        if 'text/html' in content_type or url.endswith(('.html', '.htm')) or '<!DOCTYPE html' in response.text[:100].lower():
+            # Process as HTML
+            logger.info("Processing as HTML page")
+            
+            try:
+                extracted_data = extract_html_content(response.text, url)
+                document_text = format_html_content_for_processing(extracted_data)
+                
+                # Apply word-to-number conversion for consistency
+                document_text = words_to_numbers(document_text)
+                
+                logger.info(f"HTML processing completed. Final text length: {len(document_text)}")
+                return document_text
+                
+            except Exception as e:
+                logger.error(f"HTML processing failed, trying as plain text: {str(e)}")
+                # Fallback to plain text
+                return words_to_numbers(response.text)
+        
+        else:
+            # Process as file based on URL or content type
+            filename = url.split('/')[-1].split('?')[0]  # Remove query parameters
+            if not filename or '.' not in filename:
+                # Try to determine from content type
+                if 'pdf' in content_type:
+                    filename = "document.pdf"
+                elif 'excel' in content_type or 'spreadsheet' in content_type:
+                    filename = "document.xlsx"
+                elif 'powerpoint' in content_type or 'presentation' in content_type:
+                    filename = "document.pptx"
+                elif 'word' in content_type:
+                    filename = "document.docx"
+                else:
+                    filename = "document.txt"
+            
+            # Check if format is supported
+            is_supported, error_msg = is_supported_format(filename)
+            if not is_supported and 'html' not in content_type:
+                raise HTTPException(status_code=400, detail=error_msg)
+            
+            # Process based on file type
+            document_text = await process_file_content(response.content, filename)
+            
+            logger.info(f"File processing completed. Text length: {len(document_text)}")
         
         # Clean up
         del response
@@ -705,7 +1013,6 @@ async def download_and_process_document(url: str) -> str:
     except Exception as e:
         logger.error(f"Document download/processing failed: {str(e)}")
         raise Exception(f"Download or processing failed: {str(e)}")
-
 # ---- Enhanced Embeddings and Search ----
 
 async def get_embeddings_batch(client: httpx.AsyncClient, batch: List[str], input_type: str, batch_num: int) -> List[List[float]]:
@@ -836,13 +1143,19 @@ def build_prompt(question: str, context_chunks: List[str]) -> str:
 **KEY TERMS TO LOOK FOR:** {", ".join(key_terms[:15])}
 (The above terms from your question should help identify relevant information in the context below)
 """
-    
+    # Language instruction - simple but effective
+
+    lan = detect(question)  # Detect the language from the question
+    lang = lan
+    has_non_english = lan != "en"
+    language_instruction = "**IMPORTANT: Respond in the SAME LANGUAGE as the question.**\n\n" if has_non_english else ""
+
     if is_yes_no:
         response_instruction = """This is a yes/no question. Start your response with "Yes" or "No", then provide a brief explanation with specific details in 25-40 words total."""
     else:
         response_instruction = """Answer in ONE concise, direct paragraph (40-80 words maximum). Include specific numbers, amounts, percentages, and conditions. Use figures (1, 2, 3) instead of words (one, two, three) for all numbers."""
 
-    return f"""You are an intelligent insurance analyst who understands policy documents and can reason about their content. Follow this answer hierarchy:
+    return f"""{language_instruction}You are an intelligent insurance analyst who understands policy documents and can reason about their content. Follow this answer hierarchy:
 
 **ANSWER HIERARCHY (in order of priority):**
 1. **DIRECT ANSWER**: If the exact answer is clearly stated in the context, provide it directly with specific references
