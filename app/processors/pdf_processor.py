@@ -208,13 +208,16 @@ class EnhancedPDFProcessor(SyncBaseProcessor):
             
             for page_num in range(max_pages):
                 page = doc[page_num]
-                page_text = page.get_text()
+                
+                # Extract text with table structure preservation
+                page_text = self._extract_text_with_table_structure(page)
                 
                 if page_text.strip():
                     # Apply word-to-number conversion
                     page_text = words_to_numbers(page_text)
-                    # Clean excessive whitespace
-                    cleaned_text = re.sub(r'\s+', ' ', page_text.strip())
+                    # Clean excessive whitespace but preserve table formatting
+                    cleaned_text = re.sub(r'\n\s*\n', '\n\n', page_text.strip())
+                    cleaned_text = re.sub(r'[ \t]+', ' ', cleaned_text)
                     text_parts.append(cleaned_text)
                     
                     # Extract links from this page
@@ -360,7 +363,7 @@ class EnhancedPDFProcessor(SyncBaseProcessor):
         return fetched_content
     
     def _safe_fetch_url(self, url: str, timeout: int = 10, max_size: int = 1024*1024) -> Optional[str]:
-        """Safely fetch content from a URL with proper error handling"""
+        """Safely fetch content from a URL with proper error handling and JSON parsing"""
         
         try:
             # Basic URL validation
@@ -379,7 +382,7 @@ class EnhancedPDFProcessor(SyncBaseProcessor):
                 return None
             
             # Read content with size limit
-            content = ""
+            raw_content = ""
             size = 0
             for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
                 if chunk:
@@ -387,9 +390,14 @@ class EnhancedPDFProcessor(SyncBaseProcessor):
                     if size > max_size:
                         logger.warning(f"Content too large, truncating: {url}")
                         break
-                    content += chunk
+                    raw_content += chunk
             
-            return content.strip() if content else None
+            if not raw_content:
+                return None
+            
+            # Try to parse and extract meaningful data from JSON responses
+            processed_content = self._process_fetched_content(raw_content.strip(), url)
+            return processed_content
             
         except requests.exceptions.RequestException as e:
             logger.warning(f"Request failed for {url}: {str(e)}")
@@ -398,19 +406,212 @@ class EnhancedPDFProcessor(SyncBaseProcessor):
             logger.error(f"Unexpected error fetching {url}: {str(e)}")
             return None
     
+    def _process_fetched_content(self, raw_content: str, url: str) -> str:
+        """Process and extract meaningful data from fetched content, especially JSON responses"""
+        
+        try:
+            # Try to parse as JSON first
+            if raw_content.strip().startswith(('{', '[')):
+                json_data = json.loads(raw_content)
+                return self._extract_meaningful_json_data(json_data, url)
+            else:
+                # Return raw content for non-JSON responses
+                return raw_content
+        except json.JSONDecodeError:
+            # If JSON parsing fails, return raw content
+            return raw_content
+        except Exception as e:
+            logger.warning(f"Error processing content from {url}: {str(e)}")
+            return raw_content
+    
+    def _extract_meaningful_json_data(self, json_data: Any, url: str) -> str:
+        """Extract meaningful information from JSON responses"""
+        
+        try:
+            # Handle different JSON response structures
+            meaningful_parts = []
+            
+            if isinstance(json_data, dict):
+                # Look for common data patterns in API responses
+                
+                # Pattern 1: {"success": true, "data": {...}, "message": "..."}
+                if 'data' in json_data and isinstance(json_data['data'], dict):
+                    data_content = json_data['data']
+                    if 'city' in data_content:
+                        meaningful_parts.append(f"Favorite City: {data_content['city']}")
+                    
+                    # Extract other key-value pairs from data
+                    for key, value in data_content.items():
+                        if key != 'city' and isinstance(value, (str, int, float)):
+                            meaningful_parts.append(f"{key.title()}: {value}")
+                
+                # Pattern 2: Direct data in root
+                elif 'city' in json_data:
+                    meaningful_parts.append(f"City: {json_data['city']}")
+                
+                # Pattern 3: Flight information patterns
+                if 'flight' in str(json_data).lower():
+                    for key, value in json_data.items():
+                        if 'flight' in key.lower() or 'number' in key.lower():
+                            meaningful_parts.append(f"{key.title()}: {value}")
+                
+                # Pattern 4: Extract any other meaningful key-value pairs
+                important_keys = ['id', 'code', 'number', 'name', 'location', 'address', 'phone', 'email']
+                for key, value in json_data.items():
+                    if (key.lower() in important_keys or 
+                        any(important in key.lower() for important in ['flight', 'city', 'location']) and
+                        isinstance(value, (str, int, float))):
+                        meaningful_parts.append(f"{key.title()}: {value}")
+                
+                # Include success/status messages if meaningful
+                if 'message' in json_data and json_data.get('success', False):
+                    meaningful_parts.append(f"Status: {json_data['message']}")
+            
+            elif isinstance(json_data, list):
+                # Handle array responses
+                for i, item in enumerate(json_data[:5]):  # Limit to first 5 items
+                    if isinstance(item, dict):
+                        meaningful_parts.append(f"Item {i+1}: {self._extract_meaningful_json_data(item, url)}")
+            
+            # If we extracted meaningful data, format it nicely
+            if meaningful_parts:
+                formatted_content = f"API Response from {url}:\n" + "\n".join(meaningful_parts)
+                return formatted_content
+            else:
+                # Fallback to formatted JSON
+                return f"JSON Response from {url}:\n{json.dumps(json_data, indent=2, ensure_ascii=False)}"
+        
+        except Exception as e:
+            logger.warning(f"Error extracting meaningful data from JSON: {str(e)}")
+            # Fallback to raw JSON string
+            return f"Raw JSON from {url}:\n{json.dumps(json_data, indent=2, ensure_ascii=False)}"
+    
+    def _extract_text_with_table_structure(self, page) -> str:
+        """Extract text while preserving table structure using PyMuPDF table detection"""
+        
+        try:
+            # Try to detect and extract tables first
+            tables = page.find_tables()
+            
+            if tables:
+                # If tables are found, extract them with structure preserved
+                extracted_parts = []
+                
+                # Get regular text
+                regular_text = page.get_text()
+                
+                # Extract and format tables
+                for i, table in enumerate(tables):
+                    try:
+                        # Extract table data
+                        table_data = table.extract()
+                        
+                        if table_data:
+                            extracted_parts.append(f"\n=== TABLE {i+1} ===")
+                            
+                            # Format table with proper alignment
+                            for row_idx, row in enumerate(table_data):
+                                if row and any(cell and str(cell).strip() for cell in row):
+                                    # Clean and format row
+                                    cleaned_row = [str(cell or '').strip() for cell in row]
+                                    
+                                    # Create table-like formatting
+                                    if row_idx == 0:  # Header row
+                                        formatted_row = ' | '.join(f"{cell:^15}" for cell in cleaned_row)
+                                        extracted_parts.append(formatted_row)
+                                        extracted_parts.append('-' * len(formatted_row))
+                                    else:
+                                        formatted_row = ' | '.join(f"{cell:<15}" for cell in cleaned_row)
+                                        extracted_parts.append(formatted_row)
+                            
+                            extracted_parts.append(f"=== END TABLE {i+1} ===\n")
+                    
+                    except Exception as e:
+                        logger.warning(f"Error extracting table {i}: {str(e)}")
+                        continue
+                
+                # Combine regular text with structured tables
+                if extracted_parts:
+                    return regular_text + "\n\n" + "\n".join(extracted_parts)
+                else:
+                    return regular_text
+            else:
+                # No tables detected, return regular text
+                return page.get_text()
+        
+        except Exception as e:
+            logger.warning(f"Error in table structure extraction: {str(e)}")
+            # Fallback to regular text extraction
+            return page.get_text()
+    
     def _merge_content(self, base_text: str, fetched_content: Dict[str, Any]) -> str:
-        """Merge base PDF content with fetched link content"""
+        """Merge base PDF content with fetched link content inline"""
         
-        content_parts = [base_text]
-        content_parts.append("\n" + "="*80 + "\nADDITIONAL CONTENT FROM LINKED SOURCES:\n" + "="*80)
+        if not fetched_content:
+            logger.info("🔍 DEBUG: No fetched content to merge")
+            return base_text
         
+        logger.info(f"🔍 DEBUG: Merging {len(fetched_content)} fetched items into base text")
+        
+        # Start with the base text
+        enhanced_text = base_text
+        
+        # For each fetched URL, find its position in the text and insert content inline
         for url, data in fetched_content.items():
-            content_parts.append(f"\n\n--- Content from: {url} (Page {data['page']}, Type: {data['type']}) ---")
-            content_parts.append(f"Context: {data['context'][:200]}...")
-            content_parts.append(f"\nContent:\n{data['content']}")
-            content_parts.append("-" * 40)
+            content_text = data['content']
+            logger.info(f"🔍 DEBUG: Processing URL: {url[:50]}...")
+            logger.info(f"🔍 DEBUG: Content preview: {content_text[:100]}...")
+            
+            # Try to find the URL in the text
+            url_pos = enhanced_text.find(url)
+            if url_pos != -1:
+                logger.info(f"🔍 DEBUG: Found URL at position {url_pos}, inserting content inline")
+                # Insert fetched content right after the URL
+                insertion_point = url_pos + len(url)
+                
+                # Create inline content block
+                inline_content = f"\n\n[FETCHED DATA FROM ABOVE LINK]:\n{content_text}\n[END FETCHED DATA]\n"
+                
+                # Insert the content
+                enhanced_text = (
+                    enhanced_text[:insertion_point] + 
+                    inline_content + 
+                    enhanced_text[insertion_point:]
+                )
+                logger.info("🔍 DEBUG: Content inserted inline successfully")
+            else:
+                # If URL not found exactly, try to find it in a more flexible way
+                url_parts = url.split('/')
+                if len(url_parts) >= 3:
+                    url_domain = url_parts[2]
+                    domain_pos = enhanced_text.find(url_domain)
+                    
+                    if domain_pos != -1:
+                        logger.info(f"🔍 DEBUG: Found domain {url_domain} at position {domain_pos}")
+                        # Find the end of the line containing the domain
+                        line_end = enhanced_text.find('\n', domain_pos)
+                        if line_end == -1:
+                            line_end = len(enhanced_text)
+                        
+                        # Insert content after the line
+                        inline_content = f"\n\n[FETCHED DATA FROM {url}]:\n{content_text}\n[END FETCHED DATA]\n"
+                        
+                        enhanced_text = (
+                            enhanced_text[:line_end] + 
+                            inline_content + 
+                            enhanced_text[line_end:]
+                        )
+                        logger.info("🔍 DEBUG: Content inserted after domain match")
+                    else:
+                        logger.warning(f"🔍 DEBUG: Could not find URL or domain in text for {url[:50]}...")
+                        # As a fallback, append at the end with a clear marker
+                        enhanced_text += f"\n\n[EXTERNAL DATA FROM {url}]:\n{content_text}\n[END EXTERNAL DATA]\n"
+                        logger.info("🔍 DEBUG: Content appended at end as fallback")
+                else:
+                    logger.warning(f"🔍 DEBUG: Invalid URL format: {url}")
         
-        return "\n".join(content_parts)
+        logger.info(f"🔍 DEBUG: Final enhanced text length: {len(enhanced_text)} characters")
+        return enhanced_text
     
     def get_extracted_links(self) -> List[ExtractedLink]:
         """Get all extracted links for inspection"""
