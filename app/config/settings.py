@@ -18,6 +18,16 @@ COHERE_API_KEYS = [key for key in [COHERE_API_KEY, COHERE_API_KEY_2] if key is n
 GEMINI_API_KEYS = [key for key in [GEMINI_API_KEY_1, GEMINI_API_KEY_2, GEMINI_API_KEY_3] if key is not None]
 REQUESTS_PER_KEY = 12
 
+
+# Global Variables for API Key Rotation
+current_gemini_key_index = 0
+gemini_request_count = 0
+current_cohere_key_index = 0
+
+# Global Q&A Storage
+qa_storage = []
+
+
 # Authentication
 TEAM_TOKEN = "833695cad1c0d2600066bf2b08aab7614d0dec93b4b6f0ae3acd37ef7d6fcb1c"
 
