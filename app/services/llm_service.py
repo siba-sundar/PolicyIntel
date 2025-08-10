@@ -56,9 +56,11 @@ def build_prompt(question: str, context_chunks: List[str]) -> str:
 2. If no direct answer, DEDUCE by finding patterns, rules, and logical connections in the context data
 3. Look for mathematical patterns, sequences, or operations demonstrated in similar examples
 4. Only use general knowledge if absolutely no patterns can be deduced from the context
-5. Always be transparent about your reasoning: "According to the document...", "Following the pattern shown...", "Based on similar examples..."
-6. Include specific numbers, dates, amounts, and conditions when available
-7. PRIORITY: Pattern deduction from context over standard knowledge
+5. Include specific numbers, dates, amounts, and conditions when available
+6. PRIORITY: Pattern deduction from context over standard knowledge
+
+
+**NOTE:** Always give consise answers, don't give long explantaions and only give answer for what have been asked always.
 
 **CONTEXT TO ANALYZE:**
 {context}

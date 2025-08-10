@@ -21,3 +21,7 @@ psutil
 langdetect
 bs4
 html2text
+cryptography
+pydantic
+fastapi
+python-multipart

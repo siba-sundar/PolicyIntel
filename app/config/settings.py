@@ -31,7 +31,7 @@ qa_storage = []
 
 
 # Authentication
-TEAM_TOKEN = "833695cad1c0d2600066bf2b08aab7614d0dec93b4b6f0ae3acd37ef7d6fcb1c"
+TEAM_TOKEN = os.getenv("TEAM_TOKEN")
 
 # File Processing Settings
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
