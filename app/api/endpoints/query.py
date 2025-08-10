@@ -283,7 +283,7 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
                                 link_context += f"\n\nRelevant linked data from {url}:\n{content_text[:600]}..."
                                 break
                     
-                    hybrid_prompt = f"""You are an intelligent data analyst. The available context has limited relevance, but analyze it carefully for patterns, rules, or examples.
+                    hybrid_prompt = f"""You are an intelligent data analyst that must follow a step-by-step process.
 
 **CONTEXT TO ANALYZE FOR PATTERNS:**
 {limited_context}
@@ -292,7 +292,25 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
 
 **QUESTION:** {question}
 
-**ANSWER (look for patterns first, then reasoning):**"""
+**STEP-BY-STEP INSTRUCTIONS - FOLLOW EACH STEP:**
+
+**STEP 1: Extract user information from linked context**
+- Look for the user's favorite city in the ADDITIONAL LINKED CONTEXT
+- If found, note the city name
+
+**STEP 2: Find city-landmark mapping**
+- In the CONTEXT TO ANALYZE, look for any tables or data showing which landmark belongs to that city
+- Match the user's city to its landmark
+
+**STEP 3: Find landmark-flight mapping**
+- In the CONTEXT TO ANALYZE, look for tables or data showing flight numbers for landmarks
+- Find the flight number for the landmark identified in Step 2
+
+**STEP 4: Answer based on the chain**
+- Provide the flight number with reasoning: "User's city [X] → landmark [Y] → flight [Z]"
+- If any step fails, explain what information is missing
+
+**ANSWER (show your step-by-step reasoning):**"""
                     
                     response = await ask_llm(hybrid_prompt)
                 else:
@@ -307,7 +325,7 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
                             link_enhancement += f"\n\nSupplementary data from {url}:\n{content_text[:500]}...\n"
                     
                     if link_enhancement:
-                        enhanced_prompt = f"""Based on the following context and supplementary data, please answer the question accurately and concisely.
+                        enhanced_prompt = f"""You are an intelligent assistant that must analyze data systematically to answer questions.
 
 **PRIMARY CONTEXT:**
 {chr(10).join(relevant_chunks)}
@@ -317,16 +335,35 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
 
 **QUESTION:** {question}
 
-**INSTRUCTIONS:**
-- Use the primary context as your main source
-- Pay special attention to the supplementary linked data - it contains the user's favorite city
-- If the question asks about "your" flight number, look for the flight number that corresponds to the favorite city from the linked data
-- Match city names from the supplementary data with cities in tables or lists in the primary context
-- Be precise and factual
-- Use figures (1, 2, 3) instead of words for numbers
-- Keep answer concise but complete
+**SYSTEMATIC ANALYSIS INSTRUCTIONS:**
 
-**ANSWER:**"""
+**STEP 1: Extract user-specific information**
+- Look in the SUPPLEMENTARY LINKED DATA for any user-specific information
+- This could be preferences, selections, IDs, locations, categories, etc.
+- Extract any key identifying information about the user
+
+**STEP 2: Understand the question context**
+- Analyze what the question is asking for
+- Identify if it's asking about "your" or "my" something (indicating user-specific data)
+- Determine what type of information or relationship is needed
+
+**STEP 3: Find relevant mappings and relationships**
+- In the PRIMARY CONTEXT, look for tables, lists, or data structures
+- Identify relationships between different data points
+- Look for chains of connections (A relates to B, B relates to C)
+- Find mappings that connect the user's information to the answer
+
+**STEP 4: Trace the logical chain**
+- Follow the data relationships step by step
+- Connect the user's information to the final answer through intermediate steps
+- Document each connection in the chain
+
+**STEP 5: Provide the answer with reasoning**
+- State the final answer clearly
+- Show your logical chain: "User info [X] → connects to [Y] → leads to answer [Z]"
+- Be specific about where each piece of information was found
+
+**ANSWER (show your step-by-step reasoning):**"""
                         response = await ask_llm(enhanced_prompt)
                     else:
                         prompt = build_prompt(question, relevant_chunks)

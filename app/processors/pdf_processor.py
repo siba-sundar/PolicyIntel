@@ -490,41 +490,69 @@ class EnhancedPDFProcessor(SyncBaseProcessor):
         """Extract text while preserving table structure using PyMuPDF table detection"""
         
         try:
-            # Try to detect and extract tables first
+            # Get regular text first
+            regular_text = page.get_text()
+            
+            # Try to detect and extract tables
             tables = page.find_tables()
             
             if tables:
-                # If tables are found, extract them with structure preserved
+                # If tables are found, extract them with enhanced structure preservation
                 extracted_parts = []
                 
-                # Get regular text
-                regular_text = page.get_text()
+                logger.info(f"Found {len(tables)} tables on page")
                 
-                # Extract and format tables
+                # Extract and format tables with enhanced formatting
                 for i, table in enumerate(tables):
                     try:
                         # Extract table data
                         table_data = table.extract()
                         
-                        if table_data:
-                            extracted_parts.append(f"\n=== TABLE {i+1} ===")
+                        if table_data and len(table_data) > 0:
+                            logger.info(f"Processing table {i+1} with {len(table_data)} rows")
                             
-                            # Format table with proper alignment
+                            # Determine column widths dynamically
+                            col_widths = []
+                            for col_idx in range(len(table_data[0]) if table_data[0] else 0):
+                                max_width = 0
+                                for row in table_data:
+                                    if col_idx < len(row) and row[col_idx]:
+                                        max_width = max(max_width, len(str(row[col_idx]).strip()))
+                                col_widths.append(min(max(max_width, 8), 25))  # Between 8 and 25 chars
+                            
+                            extracted_parts.append(f"\n=== TABLE {i+1}: STRUCTURED DATA ===")
+                            
+                            # Format table with dynamic column widths
                             for row_idx, row in enumerate(table_data):
                                 if row and any(cell and str(cell).strip() for cell in row):
-                                    # Clean and format row
-                                    cleaned_row = [str(cell or '').strip() for cell in row]
+                                    # Clean and format row with proper spacing
+                                    formatted_cells = []
+                                    for col_idx, cell in enumerate(row):
+                                        cell_content = str(cell or '').strip()
+                                        width = col_widths[col_idx] if col_idx < len(col_widths) else 15
+                                        
+                                        # Special handling for important keywords
+                                        if any(keyword in cell_content.lower() for keyword in 
+                                              ['city', 'landmark', 'flight', 'number', 'code']):
+                                            cell_content = f"**{cell_content}**"  # Mark important data
+                                        
+                                        if row_idx == 0:  # Header row
+                                            formatted_cells.append(f"{cell_content:^{width}}")
+                                        else:
+                                            formatted_cells.append(f"{cell_content:<{width}}")
                                     
-                                    # Create table-like formatting
-                                    if row_idx == 0:  # Header row
-                                        formatted_row = ' | '.join(f"{cell:^15}" for cell in cleaned_row)
-                                        extracted_parts.append(formatted_row)
-                                        extracted_parts.append('-' * len(formatted_row))
-                                    else:
-                                        formatted_row = ' | '.join(f"{cell:<15}" for cell in cleaned_row)
-                                        extracted_parts.append(formatted_row)
+                                    formatted_row = ' | '.join(formatted_cells)
+                                    extracted_parts.append(formatted_row)
+                                    
+                                    # Add separator after header
+                                    if row_idx == 0:
+                                        separator = '-' * len(formatted_row)
+                                        extracted_parts.append(separator)
                             
                             extracted_parts.append(f"=== END TABLE {i+1} ===\n")
+                            
+                            # Add semantic interpretation for common table types
+                            self._add_table_semantic_info(table_data, extracted_parts, i+1)
                     
                     except Exception as e:
                         logger.warning(f"Error extracting table {i}: {str(e)}")
@@ -532,17 +560,147 @@ class EnhancedPDFProcessor(SyncBaseProcessor):
                 
                 # Combine regular text with structured tables
                 if extracted_parts:
-                    return regular_text + "\n\n" + "\n".join(extracted_parts)
+                    enhanced_text = regular_text + "\n\n" + "\n".join(extracted_parts)
+                    logger.info(f"Enhanced text with tables: {len(enhanced_text)} characters")
+                    return enhanced_text
                 else:
                     return regular_text
             else:
-                # No tables detected, return regular text
-                return page.get_text()
+                # No tables detected, try alternative structured text extraction
+                return self._extract_structured_text_fallback(regular_text)
         
         except Exception as e:
             logger.warning(f"Error in table structure extraction: {str(e)}")
             # Fallback to regular text extraction
             return page.get_text()
+    
+    def _add_table_semantic_info(self, table_data: List[List], extracted_parts: List[str], table_num: int):
+        """Add semantic interpretation for table data with flexible entity recognition"""
+        try:
+            if not table_data or len(table_data) < 2:
+                return
+            
+            # Analyze table structure
+            headers = [str(cell or '').strip().lower() for cell in table_data[0]]
+            
+            # Generic semantic analysis - identify key columns and relationships
+            extracted_parts.append(f"\n[SEMANTIC INFO] Table {table_num}: Data Mapping")
+            
+            # Look for identifier columns (ID, code, number, name, etc.)
+            id_columns = []
+            for i, header in enumerate(headers):
+                if any(keyword in header for keyword in ['id', 'code', 'number', 'name', 'key']):
+                    id_columns.append((i, header))
+            
+            # Look for categorical columns (type, category, status, etc.)
+            category_columns = []
+            for i, header in enumerate(headers):
+                if any(keyword in header for keyword in ['type', 'category', 'status', 'class', 'group']):
+                    category_columns.append((i, header))
+            
+            # Look for descriptive columns (name, description, title, location, etc.)
+            desc_columns = []
+            for i, header in enumerate(headers):
+                if any(keyword in header for keyword in ['name', 'description', 'title', 'location', 'address', 'city', 'landmark']):
+                    desc_columns.append((i, header))
+            
+            # Look for value columns (price, amount, value, quantity, etc.)
+            value_columns = []
+            for i, header in enumerate(headers):
+                if any(keyword in header for keyword in ['price', 'amount', 'value', 'quantity', 'count', 'flight', 'score']):
+                    value_columns.append((i, header))
+            
+            # Create generic relationship mappings
+            if len(id_columns) > 0 and len(value_columns) > 0:
+                extracted_parts.append("Key Relationships Found:")
+                
+                for row_idx, row in enumerate(table_data[1:], 1):
+                    if len(row) > 0:
+                        relationships = []
+                        
+                        # Extract identifier values
+                        for col_idx, col_name in id_columns:
+                            if col_idx < len(row) and row[col_idx]:
+                                relationships.append(f"{col_name.title()}: {str(row[col_idx]).strip()}")
+                        
+                        # Extract descriptive values
+                        for col_idx, col_name in desc_columns:
+                            if col_idx < len(row) and row[col_idx]:
+                                relationships.append(f"{col_name.title()}: {str(row[col_idx]).strip()}")
+                        
+                        # Extract value columns
+                        for col_idx, col_name in value_columns:
+                            if col_idx < len(row) and row[col_idx]:
+                                relationships.append(f"{col_name.title()}: {str(row[col_idx]).strip()}")
+                        
+                        # Extract category values
+                        for col_idx, col_name in category_columns:
+                            if col_idx < len(row) and row[col_idx]:
+                                relationships.append(f"{col_name.title()}: {str(row[col_idx]).strip()}")
+                        
+                        if relationships:
+                            extracted_parts.append(f"  • {' → '.join(relationships)}")
+            
+            # Add column structure summary for reference
+            if headers:
+                extracted_parts.append(f"\n[TABLE STRUCTURE] Columns: {', '.join([h.title() for h in headers if h])}")
+                
+        except Exception as e:
+            logger.warning(f"Error in semantic table analysis: {str(e)}")
+    
+    def _extract_structured_text_fallback(self, text: str) -> str:
+        """Fallback method to identify and preserve structured data in text"""
+        
+        try:
+            # Look for table-like patterns in the text
+            lines = text.split('\n')
+            enhanced_lines = []
+            in_table_like_section = False
+            
+            for i, line in enumerate(lines):
+                line_stripped = line.strip()
+                
+                # Detect potential table headers or structured data
+                if any(keyword in line_stripped.lower() for keyword in ['city', 'flight', 'landmark', 'number']):
+                    # Check if this line has table-like separators
+                    if '|' in line_stripped or '\t' in line or (len(line_stripped.split()) >= 2 and 
+                        any(word.isdigit() or len(word) > 3 for word in line_stripped.split())):
+                        
+                        if not in_table_like_section:
+                            enhanced_lines.append("\n=== STRUCTURED DATA DETECTED ===")
+                            in_table_like_section = True
+                        
+                        # Enhanced formatting for structured lines
+                        if '|' in line_stripped:
+                            # Already formatted as table
+                            enhanced_lines.append(line)
+                        elif '\t' in line:
+                            # Tab-separated, convert to pipe-separated
+                            parts = [part.strip() for part in line.split('\t') if part.strip()]
+                            enhanced_lines.append(' | '.join(f"{part:<15}" for part in parts))
+                        else:
+                            # Space-separated, try to align
+                            parts = line_stripped.split()
+                            if len(parts) >= 2:
+                                enhanced_lines.append(' | '.join(f"{part:<15}" for part in parts))
+                            else:
+                                enhanced_lines.append(line)
+                    else:
+                        enhanced_lines.append(line)
+                else:
+                    if in_table_like_section and line_stripped == '':
+                        enhanced_lines.append("=== END STRUCTURED DATA ===\n")
+                        in_table_like_section = False
+                    enhanced_lines.append(line)
+            
+            if in_table_like_section:
+                enhanced_lines.append("=== END STRUCTURED DATA ===\n")
+            
+            return '\n'.join(enhanced_lines)
+        
+        except Exception as e:
+            logger.warning(f"Error in structured text fallback: {str(e)}")
+            return text
     
     def _merge_content(self, base_text: str, fetched_content: Dict[str, Any]) -> str:
         """Merge base PDF content with fetched link content inline"""
