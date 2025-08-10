@@ -1,249 +1,249 @@
-"""
-Enhanced Search Module - OPTIONAL
-This module provides additional search capabilities without modifying the existing system.
-Can be enabled via environment variable: USE_ENHANCED_SEARCH=true
-"""
-
+# app/services/enhanced_search.py
 import logging
-import os
 import re
-from typing import List, Dict, Optional
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from typing import List, Dict, Any, Optional
+from app.processors.enhanced_pdf_processor import ExtractedLink
 
 logger = logging.getLogger(__name__)
 
-class EnhancedSearchStrategy:
-    """
-    Additional search strategy that can be optionally enabled.
-    Does NOT replace existing search - adds to it.
-    """
+class EnhancedSearchService:
+    """Enhanced search service that incorporates link context and fetched content"""
     
     def __init__(self):
-        self.enabled = os.getenv("USE_ENHANCED_SEARCH", "false").lower() == "true"
-        if self.enabled:
-            logger.info("🔍 ENHANCED SEARCH ENABLED - Using additional search strategies")
+        self.search_enhancement_enabled = True
         
-        # More comprehensive term extraction for academic/technical documents
-        self.academic_terms = {
-            'newton', 'force', 'gravity', 'gravitation', 'motion', 'law', 'laws',
-            'mass', 'particle', 'attraction', 'inverse', 'square', 'distance',
-            'orbit', 'orbital', 'planet', 'planetary', 'moon', 'celestial',
-            'kepler', 'ellipse', 'elliptical', 'centripetal', 'universal',
-            'principia', 'calculus', 'fluxionary', 'mathematics', 'proof',
-            'derive', 'derivation', 'demonstrate', 'explanation', 'theory',
-            'space', 'time', 'absolute', 'relative', 'mechanics', 'physics'
-        }
+    def apply_enhanced_search_if_enabled(self, search_results: List[Dict], 
+                                      question: str, 
+                                      search_context: Dict[str, Any] = None) -> List[Dict]:
+        """
+        Apply enhanced search using link context and fetched content
+        
+        Args:
+            search_results: Original search results from FAISS
+            question: The question being asked
+            search_context: Additional context including extracted links and fetched content
+        """
+        
+        if not self.search_enhancement_enabled or not search_context:
+            return search_results
+        
+        try:
+            extracted_links = search_context.get('extracted_links', [])
+            fetched_content = search_context.get('fetched_content', {})
+            
+            if not extracted_links and not fetched_content:
+                return search_results
+            
+            logger.info(f"🔍 Applying enhanced search with {len(extracted_links)} links "
+                       f"and {len(fetched_content)} fetched items")
+            
+            # Enhance search results with link context
+            enhanced_results = self._enhance_with_link_context(
+                search_results, question, extracted_links, fetched_content
+            )
+            
+            # Re-rank results considering link relevance
+            reranked_results = self._rerank_with_link_relevance(
+                enhanced_results, question, fetched_content
+            )
+            
+            return reranked_results
+            
+        except Exception as e:
+            logger.error(f"Enhanced search failed: {str(e)}")
+            return search_results
     
-    def extract_key_concepts(self, question: str) -> List[str]:
-        """Extract key concepts from question more comprehensively"""
-        if not self.enabled:
+    def _enhance_with_link_context(self, search_results: List[Dict], 
+                                 question: str,
+                                 extracted_links: List[ExtractedLink],
+                                 fetched_content: Dict[str, Any]) -> List[Dict]:
+        """Enhance search results by adding link context information"""
+        
+        enhanced_results = search_results.copy()
+        question_keywords = set(question.lower().split())
+        
+        # For each search result, check if it references any links
+        for result in enhanced_results:
+            result_text = result.get('text', '').lower()
+            link_references = []
+            
+            # Check if this result mentions any of the extracted links
+            for link in extracted_links:
+                if any(keyword in result_text for keyword in question_keywords):
+                    # Check if link context is relevant
+                    link_context = f"{link.context} {link.surrounding_text}".lower()
+                    link_keywords = set(link_context.split())
+                    
+                    overlap = len(question_keywords.intersection(link_keywords))
+                    if overlap > 0:
+                        link_references.append({
+                            'url': link.url,
+                            'type': link.link_type,
+                            'relevance_score': overlap / len(question_keywords),
+                            'context': link.context[:200]
+                        })
+            
+            # Add link references to the result
+            if link_references:
+                result['linked_references'] = link_references
+                # Boost similarity score slightly for results with relevant links
+                if 'similarity_score' in result:
+                    boost = min(0.1, len(link_references) * 0.03)
+                    result['similarity_score'] += boost
+                    result['enhanced'] = True
+        
+        return enhanced_results
+    
+    def _rerank_with_link_relevance(self, search_results: List[Dict],
+                                   question: str,
+                                   fetched_content: Dict[str, Any]) -> List[Dict]:
+        """Re-rank search results considering relevance of fetched link content"""
+        
+        if not fetched_content:
+            return search_results
+        
+        question_keywords = set(question.lower().split())
+        
+        # Calculate link content relevance scores
+        for result in search_results:
+            link_boost = 0.0
+            
+            # Check if any fetched content is highly relevant to this question
+            for url, content_data in fetched_content.items():
+                content_text = content_data.get('content', '').lower()
+                content_words = set(content_text.split())
+                
+                # Calculate relevance between question and fetched content
+                overlap = len(question_keywords.intersection(content_words))
+                if overlap > 1:  # Require at least 2 keyword matches
+                    relevance = overlap / len(question_keywords)
+                    link_boost = max(link_boost, relevance * 0.15)  # Max 15% boost
+            
+            # Apply boost to similarity score
+            if link_boost > 0 and 'similarity_score' in result:
+                result['similarity_score'] += link_boost
+                result['link_boost'] = link_boost
+        
+        # Re-sort by enhanced similarity score
+        return sorted(search_results, 
+                     key=lambda x: x.get('similarity_score', 0), 
+                     reverse=True)
+    
+    def get_relevant_fetched_content(self, question: str, 
+                                   fetched_content: Dict[str, Any],
+                                   max_items: int = 3) -> List[Dict[str, Any]]:
+        """Get the most relevant fetched content for a specific question"""
+        
+        if not fetched_content:
             return []
         
-        question_lower = question.lower()
-        concepts = []
+        question_keywords = set(question.lower().split())
+        relevance_scores = []
         
-        # Extract academic/scientific terms
-        words = set(re.findall(r'\b\w{3,}\b', question_lower))
-        academic_matches = words.intersection(self.academic_terms)
-        concepts.extend(list(academic_matches))
+        for url, content_data in fetched_content.items():
+            content_text = content_data.get('content', '').lower()
+            content_words = set(content_text.split())
+            
+            # Calculate relevance score
+            overlap = len(question_keywords.intersection(content_words))
+            if overlap > 0:
+                relevance = overlap / len(question_keywords)
+                relevance_scores.append({
+                    'url': url,
+                    'content_data': content_data,
+                    'relevance_score': relevance,
+                    'keyword_matches': overlap
+                })
         
-        # Extract quoted phrases
-        quoted = re.findall(r'"([^"]*)"', question_lower)
-        concepts.extend(quoted)
+        # Sort by relevance and return top items
+        relevance_scores.sort(key=lambda x: x['relevance_score'], reverse=True)
+        return relevance_scores[:max_items]
+    
+    def create_enhanced_prompt(self, question: str, 
+                             regular_context: List[str],
+                             relevant_links: List[Dict[str, Any]],
+                             max_link_content: int = 500) -> str:
+        """Create an enhanced prompt that includes both regular context and link content"""
         
-        # Extract specific patterns for Newton questions
-        patterns = [
-            r'\b(three laws?)\b',
-            r'\b(inverse square)\b', 
-            r'\b(universal gravitation)\b',
-            r'\b(centripetal force)\b',
-            r'\b(orbital motion)\b',
-            r'\b(absolute space)\b',
-            r'\b(relative motion)\b',
-            r'\b(quantity of motion)\b'
+        prompt_parts = [
+            "Based on the following context and supplementary information, please answer the question accurately and concisely.",
+            "",
+            "**PRIMARY CONTEXT:**"
         ]
         
-        for pattern in patterns:
-            matches = re.findall(pattern, question_lower)
-            concepts.extend(matches)
+        # Add regular context
+        for i, context in enumerate(regular_context, 1):
+            prompt_parts.append(f"{i}. {context}")
         
-        return list(set(concepts))
-    
-    def create_expanded_queries(self, original_question: str) -> List[str]:
-        """Create additional query variations to catch more relevant content"""
-        if not self.enabled:
-            return [original_question]
-        
-        queries = [original_question]  # Always include original
-        question_lower = original_question.lower()
-        
-        # For Newton-specific questions, create variations
-        variations = []
-        
-        # If asking about laws, try different phrasings
-        if 'laws' in question_lower or 'law' in question_lower:
-            variations.extend([
-                question_lower.replace('laws of motion', 'motion laws'),
-                question_lower.replace('three laws', 'first second third law'),
-                re.sub(r'\blaw\b', 'principle', question_lower)
+        # Add relevant link content
+        if relevant_links:
+            prompt_parts.extend([
+                "",
+                "**SUPPLEMENTARY INFORMATION FROM LINKED SOURCES:**"
             ])
-        
-        # If asking about gravity/gravitation
-        if any(word in question_lower for word in ['gravity', 'gravitation', 'force']):
-            variations.extend([
-                question_lower.replace('gravity', 'gravitational force'),
-                question_lower.replace('gravitation', 'attractive force'),
-                question_lower.replace('force', 'attraction')
-            ])
-        
-        # If asking about derivation/explanation
-        if any(word in question_lower for word in ['derive', 'explain', 'demonstrate']):
-            variations.extend([
-                question_lower.replace('derive', 'show'),
-                question_lower.replace('explain', 'describe'),
-                question_lower.replace('demonstrate', 'prove')
-            ])
-        
-        # Add meaningful variations
-        for var in variations:
-            if var.strip() and var != original_question.lower():
-                queries.append(var.strip())
-        
-        return queries[:5]  # Limit to prevent too many queries
-    
-    def enhanced_chunk_scoring(self, chunks: List[Dict], question: str) -> List[Dict]:
-        """
-        Enhanced scoring that doesn't replace existing scores but adds additional signals
-        """
-        if not self.enabled or not chunks:
-            return chunks
-        
-        key_concepts = self.extract_key_concepts(question)
-        if not key_concepts:
-            return chunks
-        
-        # Add enhanced scores to existing chunks
-        enhanced_chunks = []
-        for chunk in chunks:
-            enhanced_chunk = chunk.copy()  # Don't modify original
             
-            chunk_text = chunk.get('text', '').lower()
-            
-            # Concept matching score
-            concept_matches = sum(1 for concept in key_concepts if concept in chunk_text)
-            concept_score = concept_matches / len(key_concepts) if key_concepts else 0
-            
-            # Contextual proximity score (how close key terms are to each other)
-            proximity_score = self._calculate_proximity_score(chunk_text, key_concepts)
-            
-            # Add enhanced score (don't replace existing scores)
-            enhanced_score = concept_score * 0.4 + proximity_score * 0.3
-            enhanced_chunk['enhanced_score'] = enhanced_score
-            
-            # Boost overall relevance if enhanced score is high
-            if enhanced_score > 0.3:
-                if 'final_score' in enhanced_chunk:
-                    enhanced_chunk['final_score'] *= 1.2  # Boost existing score
-                elif 'similarity_score' in enhanced_chunk:
-                    enhanced_chunk['similarity_score'] *= 1.15  # Boost existing score
-            
-            enhanced_chunks.append(enhanced_chunk)
-        
-        # Sort by enhanced relevance while preserving original ranking logic
-        enhanced_chunks.sort(key=lambda x: (
-            x.get('enhanced_score', 0) * 0.3 + 
-            x.get('final_score', x.get('similarity_score', 0)) * 0.7
-        ), reverse=True)
-        
-        return enhanced_chunks
-    
-    def _calculate_proximity_score(self, text: str, concepts: List[str]) -> float:
-        """Calculate how close key concepts are to each other in the text"""
-        if len(concepts) < 2:
-            return 0.0
-        
-        # Find positions of concepts
-        concept_positions = {}
-        for concept in concepts:
-            positions = [m.start() for m in re.finditer(re.escape(concept), text)]
-            if positions:
-                concept_positions[concept] = positions
-        
-        if len(concept_positions) < 2:
-            return 0.0
-        
-        # Calculate average distance between concept pairs
-        distances = []
-        concept_items = list(concept_positions.items())
-        
-        for i in range(len(concept_items)):
-            for j in range(i + 1, len(concept_items)):
-                concept1_positions = concept_items[i][1]
-                concept2_positions = concept_items[j][1]
+            for i, link_info in enumerate(relevant_links, 1):
+                content = link_info['content_data'].get('content', '')[:max_link_content]
+                url = link_info['url']
+                relevance = link_info['relevance_score']
                 
-                # Find minimum distance between any occurrence of the two concepts
-                min_distance = float('inf')
-                for pos1 in concept1_positions:
-                    for pos2 in concept2_positions:
-                        distance = abs(pos1 - pos2)
-                        min_distance = min(min_distance, distance)
-                
-                if min_distance != float('inf'):
-                    distances.append(min_distance)
+                prompt_parts.extend([
+                    f"{i}. Source: {url} (Relevance: {relevance:.2f})",
+                    f"   Content: {content}...",
+                    ""
+                ])
         
-        if not distances:
-            return 0.0
+        prompt_parts.extend([
+            f"**QUESTION:** {question}",
+            "",
+            "**INSTRUCTIONS:**",
+            "- Use the primary context as your main source of information",
+            "- Supplement with linked information when it adds value",
+            "- Be precise and factual in your response",
+            "- Use figures (1, 2, 3) instead of words for numbers",
+            "- Keep answer concise but complete",
+            "",
+            "**ANSWER:**"
+        ])
         
-        # Convert to proximity score (closer = higher score)
-        avg_distance = sum(distances) / len(distances)
-        max_reasonable_distance = 500  # characters
-        proximity_score = max(0, 1 - (avg_distance / max_reasonable_distance))
-        
-        return proximity_score
+        return "\n".join(prompt_parts)
     
-    def should_expand_search(self, search_results: List[Dict], question: str) -> bool:
-        """
-        Determine if we should try additional search strategies
-        """
-        if not self.enabled:
-            return False
+    def analyze_search_effectiveness(self, original_results: List[Dict],
+                                   enhanced_results: List[Dict],
+                                   question: str) -> Dict[str, Any]:
+        """Analyze the effectiveness of search enhancement"""
         
-        if not search_results:
-            return True
+        analysis = {
+            'original_result_count': len(original_results),
+            'enhanced_result_count': len(enhanced_results),
+            'results_with_links': len([r for r in enhanced_results if r.get('linked_references')]),
+            'results_boosted': len([r for r in enhanced_results if r.get('enhanced')]),
+            'average_boost': 0.0,
+            'top_result_improved': False
+        }
         
-        # Check if best result has low confidence
-        best_score = 0
-        if search_results:
-            first_result = search_results[0]
-            best_score = first_result.get('final_score', 
-                          first_result.get('similarity_score', 0))
+        # Calculate average boost
+        boosted_results = [r for r in enhanced_results if r.get('link_boost')]
+        if boosted_results:
+            analysis['average_boost'] = sum(r.get('link_boost', 0) for r in boosted_results) / len(boosted_results)
         
-        # If best score is low, try enhanced search
-        return best_score < 0.25
-    
-    def log_enhancement_usage(self, original_count: int, enhanced_count: int, question: str):
-        """Log when enhanced search provides better results"""
-        if self.enabled and enhanced_count > original_count:
-            logger.info(f"🎯 Enhanced search improved results: {original_count} → {enhanced_count} relevant chunks for question: {question[:50]}...")
+        # Check if top result improved
+        if original_results and enhanced_results:
+            original_top_score = original_results[0].get('similarity_score', 0)
+            enhanced_top_score = enhanced_results[0].get('similarity_score', 0)
+            analysis['top_result_improved'] = enhanced_top_score > original_top_score
+        
+        return analysis
 
 
-def apply_enhanced_search_if_enabled(search_results: List[Dict], question: str) -> List[Dict]:
-    """
-    Apply enhanced search strategies if enabled via environment variable.
-    This function can be called from existing code without breaking anything.
-    """
-    enhancer = EnhancedSearchStrategy()
-    
-    if not enhancer.enabled:
-        return search_results  # Return unchanged if not enabled
-    
-    # Apply enhancements
-    original_count = len([r for r in search_results if r.get('final_score', r.get('similarity_score', 0)) > 0.2])
-    enhanced_results = enhancer.enhanced_chunk_scoring(search_results, question)
-    enhanced_count = len([r for r in enhanced_results if r.get('final_score', r.get('similarity_score', 0)) > 0.2])
-    
-    enhancer.log_enhancement_usage(original_count, enhanced_count, question)
-    
-    return enhanced_results
+# Global instance
+enhanced_search_service = EnhancedSearchService()
+
+# Main function for backwards compatibility
+def apply_enhanced_search_if_enabled(search_results: List[Dict], 
+                                   question: str,
+                                   search_context: Dict[str, Any] = None) -> List[Dict]:
+    """Backwards compatible function for enhanced search"""
+    return enhanced_search_service.apply_enhanced_search_if_enabled(
+        search_results, question, search_context
+    )

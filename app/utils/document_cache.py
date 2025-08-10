@@ -12,6 +12,14 @@ from concurrent.futures import ThreadPoolExecutor
 import gc
 import psutil
 
+import hashlib
+import pickle
+import logging
+import os
+from typing import Dict, List, Any, Tuple, Optional
+from dataclasses import asdict
+from app.processors.pdf_processor import ExtractedLink
+
 logger = logging.getLogger(__name__)
 
 class DocumentCache:
@@ -247,7 +255,9 @@ class DocumentCache:
                 logger.error(f"Error checking cache: {e}")
                 return False
     
-    def save_to_cache(self, url: str, document_text: str, chunks: List[Dict], embeddings: List[List[float]]) -> bool:
+    def save_to_cache(self, url: str, document_text: str, chunks: List[Dict], 
+                     embeddings: List[List[float]], extracted_links: List = None,
+                     fetched_content: Dict = None) -> bool:
         """Save document processing results to cache"""
         
         # Check if document qualifies for caching
@@ -268,33 +278,38 @@ class DocumentCache:
                 doc_size = self._calculate_data_size_mb(document_text)
                 chunks_size = self._calculate_data_size_mb(chunks)
                 embeddings_size = self._calculate_data_size_mb(embeddings)
-                total_size = doc_size + chunks_size + embeddings_size
+                links_size = self._calculate_data_size_mb(extracted_links) if extracted_links else 0
+                content_size = self._calculate_data_size_mb(fetched_content) if fetched_content else 0
+                total_size = doc_size + chunks_size + embeddings_size + links_size + content_size
                 
                 # Save data files
                 cache_files = {
                     'document_text': document_text,
                     'chunks': chunks,
-                    'embeddings': embeddings
+                    'embeddings': embeddings,
+                    'extracted_links': extracted_links,
+                    'fetched_content': fetched_content
                 }
                 
                 saved_files = []
                 for data_type, data in cache_files.items():
-                    cache_file = self._get_cache_file_path(cache_key, data_type)
-                    try:
-                        serialized_data = self._serialize_data(data)
-                        with open(cache_file, 'wb') as f:
-                            f.write(serialized_data)
-                        saved_files.append(data_type)
-                        logger.info(f"💾 Saved {data_type} to cache ({len(serialized_data) / 1024 / 1024:.2f}MB)")
-                    except Exception as e:
-                        logger.error(f"Failed to save {data_type} to cache: {e}")
-                        # Clean up partially saved files
-                        for saved_type in saved_files:
-                            try:
-                                self._get_cache_file_path(cache_key, saved_type).unlink()
-                            except:
-                                pass
-                        return False
+                    if data is not None:  # Only save non-None data
+                        cache_file = self._get_cache_file_path(cache_key, data_type)
+                        try:
+                            serialized_data = self._serialize_data(data)
+                            with open(cache_file, 'wb') as f:
+                                f.write(serialized_data)
+                            saved_files.append(data_type)
+                            logger.info(f"💾 Saved {data_type} to cache ({len(serialized_data) / 1024 / 1024:.2f}MB)")
+                        except Exception as e:
+                            logger.error(f"Failed to save {data_type} to cache: {e}")
+                            # Clean up partially saved files
+                            for saved_type in saved_files:
+                                try:
+                                    self._get_cache_file_path(cache_key, saved_type).unlink()
+                                except:
+                                    pass
+                            return False
                 
                 # Update metadata
                 self.metadata[cache_key] = {
@@ -465,3 +480,232 @@ def create_document_cache(
         cache_expiry_hours=cache_expiry_hours,
         enable_compression=enable_compression
     )
+    
+    
+    
+    
+
+class EnhancedDocumentCache:
+    """Enhanced document cache that supports link and fetched content storage"""
+    
+    def __init__(self, cache_dir: str = "/tmp/enhanced_doc_cache"):
+        self.cache_dir = cache_dir
+        self.ensure_cache_directory()
+        
+    def ensure_cache_directory(self):
+        """Ensure cache directory exists"""
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"Could not create cache directory {self.cache_dir}: {e}")
+    
+    def _generate_cache_key(self, documents: List[Dict]) -> str:
+        """Generate a unique cache key for document set"""
+        doc_signatures = []
+        for doc in documents:
+            url = doc.get('url', '')
+            filename = doc.get('filename', '')
+            # Create a signature from URL and filename
+            signature = f"{url}:{filename}"
+            doc_signatures.append(signature)
+        
+        # Sort to ensure consistent key regardless of document order
+        doc_signatures.sort()
+        combined = "|".join(doc_signatures)
+        
+        return hashlib.md5(combined.encode()).hexdigest()
+    
+    def _get_cache_path(self, cache_key: str) -> str:
+        """Get full path for cache file"""
+        return os.path.join(self.cache_dir, f"{cache_key}.enhanced_cache")
+    
+    def save_to_cache(self, documents: List[Dict], document_text: str, 
+                     chunks: List[Dict], chunk_embeddings: List, 
+                     extracted_links: List[ExtractedLink] = None,
+                     fetched_content: Dict[str, Any] = None) -> bool:
+        """
+        Save document processing results to cache including link data
+        
+        Args:
+            documents: List of document configurations
+            document_text: Processed document text
+            chunks: Document chunks
+            chunk_embeddings: Chunk embeddings
+            extracted_links: Links extracted from the document
+            fetched_content: Content fetched from links
+        """
+        try:
+            cache_key = self._generate_cache_key(documents)
+            cache_path = self._get_cache_path(cache_key)
+            
+            # Prepare data for caching
+            cache_data = {
+                'document_text': document_text,
+                'chunks': chunks,
+                'chunk_embeddings': chunk_embeddings,
+                'extracted_links': [asdict(link) for link in extracted_links] if extracted_links else [],
+                'fetched_content': fetched_content or {},
+                'documents_signature': documents,
+                'cache_version': '2.0'  # Enhanced version
+            }
+            
+            # Save to cache
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
+                
+            logger.info(f"✅ Saved enhanced cache: {cache_key}")
+            logger.info(f"   - Document text: {len(document_text)} chars")
+            logger.info(f"   - Chunks: {len(chunks)}")
+            logger.info(f"   - Links: {len(extracted_links) if extracted_links else 0}")
+            logger.info(f"   - Fetched content: {len(fetched_content) if fetched_content else 0} items")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save enhanced cache: {str(e)}")
+            return False
+    
+    def load_from_cache(self, documents: List[Dict]) -> Optional[Tuple[str, List[Dict], List, List[ExtractedLink], Dict[str, Any]]]:
+        """
+        Load document processing results from cache including link data
+        
+        Returns:
+            Tuple of (document_text, chunks, chunk_embeddings, extracted_links, fetched_content) or None
+        """
+        try:
+            cache_key = self._generate_cache_key(documents)
+            cache_path = self._get_cache_path(cache_key)
+            
+            if not os.path.exists(cache_path):
+                return None
+                
+            with open(cache_path, 'rb') as f:
+                cache_data = pickle.load(f)
+            
+            # Validate cache version and structure
+            if cache_data.get('cache_version') != '2.0':
+                logger.warning("Cache version mismatch, invalidating cache")
+                return None
+            
+            # Reconstruct ExtractedLink objects
+            extracted_links = []
+            if cache_data.get('extracted_links'):
+                for link_dict in cache_data['extracted_links']:
+                    try:
+                        link = ExtractedLink(**link_dict)
+                        extracted_links.append(link)
+                    except Exception as e:
+                        logger.warning(f"Failed to reconstruct link object: {e}")
+                        continue
+            
+            logger.info(f"✅ Loaded enhanced cache: {cache_key}")
+            logger.info(f"   - Document text: {len(cache_data['document_text'])} chars")
+            logger.info(f"   - Chunks: {len(cache_data['chunks'])}")
+            logger.info(f"   - Links: {len(extracted_links)}")
+            logger.info(f"   - Fetched content: {len(cache_data.get('fetched_content', {}))} items")
+            
+            return (
+                cache_data['document_text'],
+                cache_data['chunks'], 
+                cache_data['chunk_embeddings'],
+                extracted_links,
+                cache_data.get('fetched_content', {})
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to load enhanced cache: {str(e)}")
+            return None
+    
+    def clear_cache(self, confirm: bool = False) -> bool:
+        """Clear all cached data"""
+        if not confirm:
+            logger.warning("Cache clear called without confirmation")
+            return False
+            
+        try:
+            if not os.path.exists(self.cache_dir):
+                return True
+                
+            cache_files = [f for f in os.listdir(self.cache_dir) if f.endswith('.enhanced_cache')]
+            
+            for cache_file in cache_files:
+                file_path = os.path.join(self.cache_dir, cache_file)
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    logger.warning(f"Failed to remove cache file {cache_file}: {e}")
+                    
+            logger.info(f"🗑️ Cleared {len(cache_files)} enhanced cache files")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to clear enhanced cache: {str(e)}")
+            return False
+    
+    def get_cache_info(self) -> Dict[str, Any]:
+        """Get information about cached data"""
+        try:
+            if not os.path.exists(self.cache_dir):
+                return {"cache_files": 0, "total_size": 0}
+                
+            cache_files = [f for f in os.listdir(self.cache_dir) if f.endswith('.enhanced_cache')]
+            total_size = 0
+            
+            for cache_file in cache_files:
+                file_path = os.path.join(self.cache_dir, cache_file)
+                try:
+                    total_size += os.path.getsize(file_path)
+                except Exception:
+                    continue
+            
+            return {
+                "cache_files": len(cache_files),
+                "total_size": total_size,
+                "total_size_mb": round(total_size / (1024 * 1024), 2)
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get cache info: {str(e)}")
+            return {"error": str(e)}
+
+
+# Global enhanced cache instance
+enhanced_document_cache = EnhancedDocumentCache()
+
+
+# Backwards compatibility wrapper for existing code
+class DocumentCacheWrapper:
+    """Wrapper to maintain backwards compatibility with existing cache code"""
+    
+    def __init__(self, enhanced_cache: EnhancedDocumentCache):
+        self.enhanced_cache = enhanced_cache
+    
+    def save_to_cache(self, url: str, document_text: str, 
+                     chunks: List[Dict], chunk_embeddings: List,
+                     extracted_links: List = None, 
+                     fetched_content: Dict = None) -> bool:
+        """Backwards compatible save method"""
+        # Convert single URL to document format expected by enhanced cache
+        documents = [{'url': url}]
+        return self.enhanced_cache.save_to_cache(
+            documents, document_text, chunks, chunk_embeddings,
+            extracted_links, fetched_content
+        )
+    
+    def load_from_cache(self, url: str):
+        """Backwards compatible load method"""
+        # Convert single URL to document format expected by enhanced cache
+        documents = [{'url': url}]
+        result = self.enhanced_cache.load_from_cache(documents)
+        if result:
+            # Return only the first 3 elements for backwards compatibility
+            return result[:3]
+        return None
+    
+    def clear_cache(self, confirm: bool = False) -> bool:
+        """Backwards compatible clear method"""
+        return self.enhanced_cache.clear_cache(confirm)
+
+
+# Create wrapper instance for backwards compatibility
+document_cache = DocumentCacheWrapper(enhanced_document_cache)

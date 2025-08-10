@@ -7,7 +7,7 @@ from app.config.settings import MAX_FILE_SIZE
 from app.utils.file_utils import get_file_extension, is_supported_format
 from app.utils.memory_utils import clear_memory
 from app.utils.text_utils import words_to_numbers
-from app.processors.pdf_processor import PDFProcessor
+from app.processors.pdf_processor import EnhancedPDFProcessor
 from app.processors.excel_processor import ExcelProcessor
 from app.processors.powerpoint_processor import PowerPointProcessor
 from app.processors.word_processor import WordProcessor
@@ -23,7 +23,7 @@ class DocumentService:
     
     def __init__(self):
         self.processors = {
-            'pdf': PDFProcessor(),
+            'pdf': EnhancedPDFProcessor(),
             'xlsx': ExcelProcessor(),
             'xls': ExcelProcessor(),
             'pptx': PowerPointProcessor(),
