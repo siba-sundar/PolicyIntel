@@ -2,6 +2,8 @@ import os
 from dotenv import load_dotenv
 from typing import List
 
+from app.utils.document_cache import create_document_cache
+
 # Load environment variables
 load_dotenv()
 
@@ -104,3 +106,17 @@ if LARGE_DOC_MODE:
 # Validation
 if not COHERE_API_KEYS or not GEMINI_API_KEYS:
     raise ValueError("Missing required API keys. Check COHERE_API_KEY and GEMINI_API_KEY environment variables.")
+
+
+
+
+
+
+# Initialize shared document cache
+document_cache = create_document_cache(
+    cache_dir="document_cache",
+    min_cache_threshold=50000,
+    max_cache_size_mb=500,
+    cache_expiry_hours=1,
+    enable_compression=True
+)

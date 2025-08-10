@@ -12,9 +12,15 @@ from app.services.chunking import get_enhanced_chunks
 from app.services.embedding_service import get_embeddings
 from app.services.faiss_search import FAISSSearchService
 from app.services.llm_service import ask_llm, build_prompt
+from app.config.settings import document_cache
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+
+startup_clear = document_cache.clear_cache(confirm=True)
+logger.info(f"startup cache clear: {startup_clear}")
 
 @router.post("/hackrx/run", response_model=QueryResponse)
 async def run_query(request: QueryRequest, authorization: str = Header(None)):
@@ -45,31 +51,44 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
         logger.info("📄 Starting enhanced document processing")
         log_memory_usage("Before document processing")
         
-        document_text = await document_service.download_and_process_document(request.documents)
-        log_memory_usage("After document download")
         
-        if not document_text.strip():
-            logger.error("No text extracted from document")
-            raise HTTPException(status_code=400, detail="No text could be extracted from the document")
+        #check if document is cached
+        cached_result = document_cache.load_from_cache(request.documents)
+        if cached_result:
+            document_text, chunks, chunk_embeddings = cached_result
+            logger.info("Using cached document processing results")
+            log_memory_usage("After cache load")
+            
+        else:
+            document_text = await document_service.download_and_process_document(request.documents)
+            log_memory_usage("After document download")
         
-        # Use improved semantic chunking
-        logger.info("🧩 Starting document chunking")
-        chunks = get_enhanced_chunks(document_text)
-        log_memory_usage("After chunking")
-        
-        if not chunks:
-            logger.error("No chunks created from document")
-            raise HTTPException(status_code=400, detail="No meaningful chunks could be created from the document")
-        
+            if not document_text.strip():
+                logger.error("No text extracted from document")
+                raise HTTPException(status_code=400, detail="No text could be extracted from the document")
+            
+            # Use improved semantic chunking
+            logger.info("🧩 Starting document chunking")
+            chunks = get_enhanced_chunks(document_text)
+            log_memory_usage("After chunking")
+            
+            if not chunks:
+                logger.error("No chunks created from document")
+                raise HTTPException(status_code=400, detail="No meaningful chunks could be created from the document")
+            
+            # Get embeddings for chunks
+            logger.info("🤖 Getting embeddings")
+            chunk_texts = [chunk["text"] for chunk in chunks]
+            chunk_embeddings = await get_embeddings(chunk_texts, input_type="search_document")
+            log_memory_usage("After chunk embeddings")
+            
+            # Save to cache if document is large enough
+            document_cache.save_to_cache(request.documents, document_text, chunks, chunk_embeddings)
+            
+            
         # Clear document text from memory after chunking
         cleanup_variables(document_text)
         clear_memory("Document text cleanup")
-        
-        # Get embeddings for chunks and questions
-        logger.info("🤖 Getting embeddings")
-        chunk_texts = [chunk["text"] for chunk in chunks]
-        chunk_embeddings = await get_embeddings(chunk_texts, input_type="search_document")
-        log_memory_usage("After chunk embeddings")
         
         question_embeddings = await get_embeddings(request.questions, input_type="search_query")
         log_memory_usage("After question embeddings")
@@ -214,11 +233,19 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
         # Rotate Cohere API key for the next request
         rotate_cohere_key()
         
+        logger.info("clearing cache after successful request completion")
+        cache_clear_result = document_cache.clear_cache(confirm=True)
+        logger.info(f"Cache cleared:{cache_clear_result}")
+        
         return QueryResponse(answers=answers)
         
     except HTTPException as he:
         logger.error(f"HTTP Exception: {he.detail}")
+        cache_clear_result = document_cache.clear_cache(confirm=True)
+        logger.info(f"Cache Cleared:{cache_clear_result}")
         raise he
     except Exception as e:
         logger.error(f"Unexpected error in run_query: {str(e)}", exc_info=True)
+        cache_clear_result = document_cache.clear_cache(confirm=True)
+        logger.info(f"Cache Cleared:{cache_clear_result}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
