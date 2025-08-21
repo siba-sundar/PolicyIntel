@@ -1,0 +1,310 @@
+{% extends 'claims/base.html' %}
+
+{% block title %}{{ page_title }}{% endblock %}
+
+{% block content %}
+<!-- Main Container -->
+<div class="w-full max-w-4xl mx-auto">
+    <!-- Main Card -->
+    <div class="bg-white rounded-2xl shadow-2xl p-8 mb-6">
+        <!-- Header -->
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-custom-blue mb-2">HackRx AI Claims Assistant</h1>
+            <p class="text-gray-600">Submit your insurance query and get instant claim analysis</p>
+        </div>
+
+        <!-- Input Section -->
+        <div class="mb-8">
+            <form id="claimsForm" method="post" action="{% url 'claims:submit_query' %}" class="space-y-4">
+                {% csrf_token %}
+                <div>
+                    {{ form.query_text.label_tag }}
+                    {{ form.query_text }}
+                    {% if form.query_text.errors %}
+                        <div class="text-red-600 text-sm mt-1">
+                            {{ form.query_text.errors.0 }}
+                        </div>
+                    {% endif %}
+                </div>
+                
+                <div class="flex gap-3">
+                    <button 
+                        type="submit" 
+                        id="submitBtn"
+                        class="flex-1 bg-custom-blue text-white font-semibold py-3 px-6 rounded-lg hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed">
+                        <span id="submitText">Submit Query</span>
+                        <span id="loadingText" class="hidden">Processing...</span>
+                    </button>
+                    
+                    <button 
+                        type="button" 
+                        id="micBtn"
+                        class="bg-gray-500 text-white font-semibold py-3 px-6 rounded-lg hover:bg-gray-600 focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 transition-all duration-200">
+                        🎤
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <!-- AJAX Results Section (Hidden initially) -->
+        <div id="resultsSection" class="hidden">
+            <hr class="border-gray-200 mb-8">
+            
+            <!-- Query Details Grid -->
+            <div class="mb-8">
+                <h2 class="text-xl font-semibold text-gray-800 mb-4">Extracted Query Details</h2>
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div class="bg-gray-50 p-4 rounded-lg text-center">
+                        <div class="text-sm font-medium text-gray-600 mb-1">Age</div>
+                        <div id="ageValue" class="text-lg font-semibold text-gray-800">-</div>
+                    </div>
+                    <div class="bg-gray-50 p-4 rounded-lg text-center">
+                        <div class="text-sm font-medium text-gray-600 mb-1">Procedure</div>
+                        <div id="procedureValue" class="text-lg font-semibold text-gray-800">-</div>
+                    </div>
+                    <div class="bg-gray-50 p-4 rounded-lg text-center">
+                        <div class="text-sm font-medium text-gray-600 mb-1">Location</div>
+                        <div id="locationValue" class="text-lg font-semibold text-gray-800">-</div>
+                    </div>
+                    <div class="bg-gray-50 p-4 rounded-lg text-center">
+                        <div class="text-sm font-medium text-gray-600 mb-1">Policy Age</div>
+                        <div id="policyAgeValue" class="text-lg font-semibold text-gray-800">-</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Claim Decision -->
+            <div class="mb-8">
+                <h2 class="text-xl font-semibold text-gray-800 mb-4">Claim Decision</h2>
+                <div class="space-y-4">
+                    <!-- Status Box -->
+                    <div id="statusBox" class="p-6 rounded-lg text-center">
+                        <div id="statusIcon" class="text-3xl mb-2"></div>
+                        <div id="statusText" class="text-2xl font-bold"></div>
+                    </div>
+                    
+                    <!-- Payout Estimate -->
+                    <div class="bg-blue-50 border border-blue-200 p-4 rounded-lg">
+                        <div class="flex items-center justify-between">
+                            <span class="text-lg font-medium text-blue-800">Payout Estimate</span>
+                            <span id="payoutAmount" class="text-2xl font-bold text-blue-900">₹0</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Reasoning -->
+            <div class="mb-8">
+                <h2 class="text-xl font-semibold text-gray-800 mb-4">Decision Reasoning</h2>
+                <div id="reasoningList" class="space-y-3">
+                    <!-- Reasoning points will be populated here -->
+                </div>
+            </div>
+
+            <!-- Policy Document Link -->
+            <div class="text-center">
+                <button 
+                    id="policyDocBtn"
+                    class="text-custom-blue hover:text-blue-700 font-medium underline focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 rounded transition-colors duration-200">
+                    Open Full Policy Document
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Error Message (Hidden initially) -->
+    <div id="errorSection" class="hidden bg-red-50 border border-red-200 rounded-lg p-4 text-center">
+        <div class="text-red-800 font-medium" id="errorMessage"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    // DOM Elements
+    const form = document.getElementById('claimsForm');
+    const queryInput = document.getElementById('queryInput');
+    const submitBtn = document.getElementById('submitBtn');
+    const submitText = document.getElementById('submitText');
+    const loadingText = document.getElementById('loadingText');
+    const micBtn = document.getElementById('micBtn');
+    const resultsSection = document.getElementById('resultsSection');
+    const errorSection = document.getElementById('errorSection');
+    const errorMessage = document.getElementById('errorMessage');
+
+    // Result elements
+    const ageValue = document.getElementById('ageValue');
+    const procedureValue = document.getElementById('procedureValue');
+    const locationValue = document.getElementById('locationValue');
+    const policyAgeValue = document.getElementById('policyAgeValue');
+    const statusBox = document.getElementById('statusBox');
+    const statusIcon = document.getElementById('statusIcon');
+    const statusText = document.getElementById('statusText');
+    const payoutAmount = document.getElementById('payoutAmount');
+    const reasoningList = document.getElementById('reasoningList');
+    const policyDocBtn = document.getElementById('policyDocBtn');
+
+    // Mic button functionality
+    micBtn.addEventListener('click', function() {
+        alert('Audio feature will be added in the future');
+    });
+
+    // AJAX form submission for real-time results
+    const ajaxToggle = document.createElement('input');
+    ajaxToggle.type = 'checkbox';
+    ajaxToggle.checked = true;
+    ajaxToggle.id = 'ajaxToggle';
+    
+    const ajaxLabel = document.createElement('label');
+    ajaxLabel.htmlFor = 'ajaxToggle';
+    ajaxLabel.className = 'flex items-center text-sm text-gray-600 mt-2';
+    ajaxLabel.innerHTML = '<input type="checkbox" id="ajaxToggle" checked class="mr-2"> Enable real-time results (AJAX)';
+    
+    form.appendChild(ajaxLabel);
+
+    // Handle form submission
+    form.addEventListener('submit', async function(e) {
+        if (document.getElementById('ajaxToggle').checked) {
+            e.preventDefault(); // Prevent normal form submission
+            
+            const query = queryInput.value.trim();
+            if (!query) return;
+
+            // Show loading state
+            setLoadingState(true);
+            hideError();
+            hideResults();
+
+            try {
+                const response = await fetch('{% url "claims:api_submit_query" %}', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': document.querySelector('[name=csrfmiddlewaretoken]').value
+                    },
+                    body: JSON.stringify({
+                        query: query
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                displayResults(data);
+
+            } catch (error) {
+                console.error('Error:', error);
+                showError('Failed to process your query. Please try again later.');
+            } finally {
+                setLoadingState(false);
+            }
+        }
+        // If AJAX is disabled, let the form submit normally
+    });
+
+    // Policy document button
+    policyDocBtn.addEventListener('click', function() {
+        alert('Policy document feature will be implemented to open the full policy document');
+    });
+
+    function setLoadingState(loading) {
+        if (loading) {
+            submitBtn.disabled = true;
+            submitText.classList.add('hidden');
+            loadingText.classList.remove('hidden');
+        } else {
+            submitBtn.disabled = false;
+            submitText.classList.remove('hidden');
+            loadingText.classList.add('hidden');
+        }
+    }
+
+    function hideError() {
+        errorSection.classList.add('hidden');
+    }
+
+    function showError(message) {
+        errorMessage.textContent = message;
+        errorSection.classList.remove('hidden');
+    }
+
+    function hideResults() {
+        resultsSection.classList.add('hidden');
+    }
+
+    function displayResults(data) {
+        // Populate extracted details
+        ageValue.textContent = data.age || '-';
+        procedureValue.textContent = data.procedure || '-';
+        locationValue.textContent = data.location || '-';
+        policyAgeValue.textContent = data.policy_age || '-';
+
+        // Set status
+        const isApproved = data.status === 'APPROVED';
+        statusBox.className = `p-6 rounded-lg text-center ${
+            isApproved 
+            ? 'bg-green-100 border-2 border-approved-green' 
+            : 'bg-red-100 border-2 border-rejected-red'
+        }`;
+        statusIcon.textContent = isApproved ? '✅' : '❌';
+        statusText.textContent = data.status || 'PENDING';
+        statusText.className = `text-2xl font-bold ${
+            isApproved ? 'text-approved-green' : 'text-rejected-red'
+        }`;
+
+        // Set payout
+        payoutAmount.textContent = `₹${(data.payout || 0).toLocaleString('en-IN')}`;
+
+        // Populate reasoning
+        reasoningList.innerHTML = '';
+        if (data.reasons && data.reasons.length > 0) {
+            data.reasons.forEach((reason, index) => {
+                const reasonDiv = document.createElement('div');
+                reasonDiv.className = 'flex items-start space-x-3 p-3 bg-gray-50 rounded-lg';
+                reasonDiv.innerHTML = `
+                    <div class="flex-shrink-0 w-6 h-6 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center text-sm font-medium">
+                        ${index + 1}
+                    </div>
+                    <div class="text-gray-700">${reason}</div>
+                `;
+                reasoningList.appendChild(reasonDiv);
+            });
+        } else {
+            reasoningList.innerHTML = '<div class="text-gray-500 italic">No reasoning provided</div>';
+        }
+
+        // Show results
+        resultsSection.classList.remove('hidden');
+        
+        // Scroll to results
+        resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    // Sample data for testing
+    function loadSampleData() {
+        const sampleResponse = {
+            "age": 46,
+            "procedure": "Knee surgery",
+            "location": "Pune",
+            "policy_age": "6 months",
+            "status": "APPROVED",
+            "payout": 5000,
+            "reasons": [
+                "Clause 4.2.1: Surgeries covered after 60 days from policy start",
+                "Clause 3.5: Knee surgeries covered under general hospitalization",
+                "Clause 2.4: Pune falls within covered network hospitals"
+            ]
+        };
+        displayResults(sampleResponse);
+    }
+
+    // Add a demo button for testing
+    const demoBtn = document.createElement('button');
+    demoBtn.textContent = 'Load Demo Data';
+    demoBtn.className = 'fixed bottom-4 right-4 bg-gray-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-gray-700';
+    demoBtn.onclick = loadSampleData;
+    document.body.appendChild(demoBtn);
+</script>
+{% endblock %}

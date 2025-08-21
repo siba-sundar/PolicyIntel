@@ -1,0 +1,124 @@
+{% extends 'claims/base.html' %}
+
+{% block title %}{{ page_title }}{% endblock %}
+
+{% block content %}
+<div class="w-full max-w-4xl mx-auto">
+    <div class="bg-white rounded-2xl shadow-2xl p-8">
+        <!-- Header -->
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-custom-blue mb-2">Query Result #{{ query.id }}</h1>
+            <p class="text-gray-600">Submitted on {{ query.submitted_at|date:"M d, Y \a\t H:i" }}</p>
+        </div>
+
+        <!-- Original Query -->
+        <div class="mb-8">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Original Query</h2>
+            <div class="bg-gray-50 p-4 rounded-lg">
+                <p class="text-gray-700">{{ query.query_text }}</p>
+            </div>
+        </div>
+
+        <!-- Query Details Grid -->
+        <div class="mb-8">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Extracted Query Details</h2>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div class="bg-gray-50 p-4 rounded-lg text-center">
+                    <div class="text-sm font-medium text-gray-600 mb-1">Age</div>
+                    <div class="text-lg font-semibold text-gray-800">{{ query.age|default:"-" }}</div>
+                </div>
+                <div class="bg-gray-50 p-4 rounded-lg text-center">
+                    <div class="text-sm font-medium text-gray-600 mb-1">Procedure</div>
+                    <div class="text-lg font-semibold text-gray-800">{{ query.procedure|default:"-" }}</div>
+                </div>
+                <div class="bg-gray-50 p-4 rounded-lg text-center">
+                    <div class="text-sm font-medium text-gray-600 mb-1">Location</div>
+                    <div class="text-lg font-semibold text-gray-800">{{ query.location|default:"-" }}</div>
+                </div>
+                <div class="bg-gray-50 p-4 rounded-lg text-center">
+                    <div class="text-sm font-medium text-gray-600 mb-1">Policy Age</div>
+                    <div class="text-lg font-semibold text-gray-800">{{ query.policy_age|default:"-" }}</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Claim Decision -->
+        <div class="mb-8">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Claim Decision</h2>
+            <div class="space-y-4">
+                <!-- Status Box -->
+                <div class="p-6 rounded-lg text-center {% if query.status == 'APPROVED' %}bg-green-100 border-2 border-approved-green{% elif query.status == 'REJECTED' %}bg-red-100 border-2 border-rejected-red{% else %}bg-yellow-100 border-2 border-yellow-500{% endif %}">
+                    <div class="text-3xl mb-2">
+                        {% if query.status == 'APPROVED' %}✅{% elif query.status == 'REJECTED' %}❌{% else %}⏳{% endif %}
+                    </div>
+                    <div class="text-2xl font-bold {% if query.status == 'APPROVED' %}text-approved-green{% elif query.status == 'REJECTED' %}text-rejected-red{% else %}text-yellow-700{% endif %}">
+                        {{ query.status|default:"PENDING" }}
+                    </div>
+                </div>
+                
+                <!-- Payout Estimate -->
+                <div class="bg-blue-50 border border-blue-200 p-4 rounded-lg">
+                    <div class="flex items-center justify-between">
+                        <span class="text-lg font-medium text-blue-800">Payout Estimate</span>
+                        <span class="text-2xl font-bold text-blue-900">₹{{ query.payout|default:"0"|floatformat:"0" }}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Reasoning -->
+        <div class="mb-8">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Decision Reasoning</h2>
+            <div class="space-y-3">
+                {% if reasons %}
+                    {% for reason in reasons %}
+                        <div class="flex items-start space-x-3 p-3 bg-gray-50 rounded-lg">
+                            <div class="flex-shrink-0 w-6 h-6 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center text-sm font-medium">
+                                {{ forloop.counter }}
+                            </div>
+                            <div class="text-gray-700">{{ reason.reason_text }}</div>
+                        </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="text-gray-500 italic">No reasoning provided</div>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Processing Information -->
+        <div class="mb-8">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Processing Information</h2>
+            <div class="bg-gray-50 p-4 rounded-lg">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                    <div>
+                        <span class="font-medium text-gray-600">Submitted:</span>
+                        <span class="text-gray-800">{{ query.submitted_at|date:"M d, Y \a\t H:i:s" }}</span>
+                    </div>
+                    {% if query.processed_at %}
+                    <div>
+                        <span class="font-medium text-gray-600">Processed:</span>
+                        <span class="text-gray-800">{{ query.processed_at|date:"M d, Y \a\t H:i:s" }}</span>
+                    </div>
+                    {% endif %}
+                    {% if query.processing_time_seconds %}
+                    <div>
+                        <span class="font-medium text-gray-600">Processing Time:</span>
+                        <span class="text-gray-800">{{ query.processing_time_seconds|floatformat:"2" }}s</span>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="text-center space-x-4">
+            <a href="{% url 'claims:home' %}" class="bg-custom-blue text-white font-semibold py-3 px-6 rounded-lg hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-all duration-200">
+                Submit New Query
+            </a>
+            <a href="{% url 'claims:history' %}" class="bg-gray-500 text-white font-semibold py-3 px-6 rounded-lg hover:bg-gray-600 focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 transition-all duration-200">
+                View History
+            </a>
+        </div>
+    </div>
+</div>
+{% endblock %}
