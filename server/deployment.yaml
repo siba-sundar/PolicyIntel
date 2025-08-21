@@ -1,0 +1,22 @@
+apiVersion: app/v1
+kind: Deployment
+metadata:
+  name: policyintel-deployment
+  labels:
+    app: policyintel
+
+spec:
+  replica: 3
+  selector: 
+    matchLabels:
+      app: policyintel
+  template: 
+    metadata:
+      labels:
+        app: policyintel
+    spec:
+      container:
+      - name: policyintel
+        image: usualbread/hackrx-v14:latest
+        ports:
+        - containerPort: 8080
