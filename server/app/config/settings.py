@@ -30,6 +30,12 @@ current_cohere_key_index = 0
 qa_storage = []
 
 
+PG_DATABASE = os.getenv("PG_DATABASE")
+PG_USER =  os.getenv("PG_USER")
+PG_PASSWORD = os.getenv("PG_PASSWORD")
+PG_HOST = "localhost"
+PG_PORT = "5432"
+
 # Authentication
 TEAM_TOKEN = os.getenv("TEAM_TOKEN")
 

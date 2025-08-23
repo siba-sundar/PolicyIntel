@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from app.api.endpoints import health, status, query
 from app.config.settings import SUPPORTED_FORMATS, GEMINI_API_KEYS, COHERE_API_KEYS
 from app.utils.memory_utils import get_memory_usage
+from fastapi.middleware.cors import CORSMiddleware
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +19,14 @@ app = FastAPI(
     title="PolicyIntel API", 
     description="Document processing and Q&A API with intelligent reasoning", 
     version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
 )
 
 # Include routers
